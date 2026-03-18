@@ -1,13 +1,14 @@
+import sys
 from collections import deque
 from statistics import median
 
 from PIL import Image
 
-IMAGE_PATH = r"C:\Users\smdea\OneDrive\Pictures\shield-icon-svg-download-png-3211.png"
-
 
 def main() -> None:
-    img = Image.open(IMAGE_PATH).convert("RGBA")
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: python analyze_shield_reference.py <path-to-image>")
+    img = Image.open(sys.argv[1]).convert("RGBA")
     width, height = img.size
     px = img.load()
 

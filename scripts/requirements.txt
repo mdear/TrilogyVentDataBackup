@@ -1,0 +1,9 @@
+# Pinned Python dependencies for VentBackupManager dev scripts.
+# Generated from requirements.in — do not edit manually.
+# Regenerate with: pip-compile requirements.in -o requirements.txt
+#
+# Only needed for scripts/analyze_shield_reference.py (icon development tool).
+# The wizard itself (VentBackupManager.ps1) has no Python dependencies.
+
+pillow==12.1.1
+    # via -r requirements.in

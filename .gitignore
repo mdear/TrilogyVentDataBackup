@@ -1,0 +1,38 @@
+# ════════════════════════════════════════════════════════════════
+# Patient / device data — NEVER commit these
+# ════════════════════════════════════════════════════════════════
+
+# Date-named backup folders (e.g. 12.1.2025/, 4.10.2024/)
+/[0-9]*/
+
+# Trilogy / Tril backup folders (e.g. "trilogy 1.31.2022/", "Tril 077908-17-2025/")
+/[Tt]ril*/
+
+# Golden archive directory (wherever it is under the workspace root)
+_golden_*/
+
+# EDF data files — safety net
+*.edf
+*.EDF
+
+# ════════════════════════════════════════════════════════════════
+# Python environment
+# ════════════════════════════════════════════════════════════════
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ════════════════════════════════════════════════════════════════
+# OS / Dropbox artifacts
+# ════════════════════════════════════════════════════════════════
+desktop.ini
+.dropbox
+.dropbox.cache
+Thumbs.db
+
+# stray NUL device file (Windows artifact)
+null
+
+# SD card staging folders (e.g. "SD card 26-03-18/")
+/[Ss][Dd] */

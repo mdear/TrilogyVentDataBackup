@@ -120,8 +120,8 @@ The output is compatible with Philips **DirectView** software.
 | `scripts/` | All tool code — do not modify |
 | `scripts/modules/` | PowerShell modules (parsers, analyzers, etc.) |
 | `scripts/assets/` | Generated icon file |
-| `scripts/ARCHITECTURE.md` | Technical reference — what the tool does and why |
-| `scripts/DESIGN.md` | Technical reference — how the tool is built |
+| `.github/docs/ARCHITECTURE.md` | Technical reference — what the tool does and why |
+| `.github/docs/DESIGN.md` | Technical reference — how the tool is built |
 | `_golden_*/` | Clean per-device archives (created by the tool) |
 | Everything else | Your ventilator backup folders |
 

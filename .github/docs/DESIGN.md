@@ -194,8 +194,10 @@ scripts/
     VBM-Backup.psm1              # Ingest SD card to timestamped backup folder
     VBM-Dedup.psm1               # Hardlink deduplication with safety protocol
     VBM-UI.psm1                  # Wizard prompts, progress display, formatting
-  ARCHITECTURE.md                # Why and what (requirements, features)
-  DESIGN.md                      # How (this file)
+.github/
+  docs/
+    ARCHITECTURE.md              # Why and what (requirements, features)
+    DESIGN.md                    # How (this file)
 ```
 
 ## VBM-Parsers.psm1
