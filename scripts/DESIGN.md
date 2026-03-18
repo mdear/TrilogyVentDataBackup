@@ -119,6 +119,47 @@ Read ARCHITECTURE.md "SD Card Data Format Reference" before implementing.
 - Subsequent golden: only devices with new/modified data since last golden
 - Each included device gets its complete dataset (self-contained)
 - `manifest.json` references the previous golden for full chain of custody
+- **Self-consistency requirement**: A golden archive must be internally self-consistent.
+  Creating it may require *rewinding* the collected file set to the latest state that
+  satisfies all consistency rules (see Rewind Algorithm below). Files that would make
+  the archive inconsistent are dropped or replaced rather than included as-is.
+- **Contaminated backup salvage**: Devices whose data exists exclusively in a
+  contaminated backup are not silently lost. The builder performs a second pass over
+  contaminated backups and salvages Trilogy files whose EDF header SN affirmatively
+  identifies the target device, and P-Series files via their unambiguous
+  `P-Series/{SN}/` path. Salvage events appear in the per-device `rewindLog`.
+
+### Rewind Algorithm
+After gathering all candidate files for a device, both `New-GoldenArchive` and
+`Update-GoldenArchive` apply the following rules before copying anything to the
+golden directory. Events are recorded in the per-device `rewindLog`.
+
+**Trilogy rules** (applied by `_RewindTrilogyFiles`):
+
+| # | Rule | Action | Log entry |
+|---|------|--------|-----------|
+| 1a | AD_YYYYMM_NNN without matching DD_YYYYMM_NNN | Drop orphaned AD | `DroppedOrphan` |
+| 1a | DD_YYYYMM_NNN without matching AD_YYYYMM_NNN | Drop orphaned DD | `DroppedOrphan` |
+| 1b | WD_YYYYMMDD_NNN whose YYYYMM has no complete AD+DD pair | Drop WD | `DroppedOrphan` |
+| 1c | EL_{SN}_{YYYYMMDD}.csv whose YYYYMM has no complete AD+DD pair | Drop EL_ | `DroppedOrphan` |
+| 1d | NNN sequence gaps within a month | Report only — adjacent files are self-consistent | _(none)_ |
+
+**P-Series rules** (applied by `_RewindPSeriesFiles`):
+
+| # | Rule | Action | Log entry |
+|---|------|--------|-----------|
+| 2a | SL_SAPPHIRE.json not valid JSON | Fallback to largest valid version across clean backups, or omit | `ReplacedInvalid` / `DroppedInvalid` |
+| 2b | prop.txt missing valid SN= line matching device SN | Fallback to most recent backup with correct SN=; keep chosen if no fallback (flagged by Test-GoldenContent) | `ReplacedInvalid` |
+| 2c | PP JSON ring-buffer entry for month with no complete AD+DD pair | Drop entry | `DroppedOrphan` |
+| 2d | BlowerHours regression across backups | Report only — too risky to auto-correct | _(none)_ |
+| 2e | TRANSMITFILE.SEQ count > FILES.SEQ count | Report only — format unknown | _(none)_ |
+
+**Contaminated backup salvage** (applied during `_GatherTrilogyFiles` / `_GatherPSeriesFiles`):
+
+| # | Source | Safety net | Log entry |
+|---|--------|------------|-----------|
+| S1 | EDF file in a contaminated backup | EDF header SN must affirmatively equal target device SN | `SalvagedFromContaminated` |
+| S2 | P-Series file in a contaminated backup | `P-Series/{SN}/` path attribution — unambiguous | `SalvagedFromContaminated` |
 
 ## Module Layout
 
@@ -279,32 +320,37 @@ Renders the Table of Contents to the console:
 Builds the first golden archive.
 
 **Algorithm**:
-1. For each device (or specified subset):
-   a. Gather all files attributed to that device across all clean backups.
-      Attribution comes from EDF header SN (Trilogy files), filename SN
-      (EL_ CSV, BIN), or folder path (P-Series/{SN}/).
-   b. Group by (device SN + relative filename), e.g. group all copies of
-      `AD_202303_000.edf` attributed to TVXX0000001 across backups.
-      **IMPORTANT**: The same filename (e.g. AD_202408_000.edf) may exist
-      for DIFFERENT devices — SN filtering in step (a) prevents cross-device
-      mixing. Never group by filename alone.
-   c. For each group: pick the file with the largest size (most complete tip)
-   d. Verify picked file's EDF header SN matches the target device
-   e. Copy into `_golden_YYYY-MM-DD/{SN}/Trilogy/` and `.../P-Series/`
-2. For P-Series: take the most recent backup's version of steering files
-   (FILES.SEQ, TRANSMITFILE.SEQ, SL_SAPPHIRE.json, prop.txt) since they grow
-   monotonically. Ring buffer slots (P0-P7): collect ALL unique files from
-   ALL backups since the ring buffer is circular and older backups may hold
-   sessions that were since overwritten on the SD card.
-3. If device is flagged `SplitSD = $true` (see `Detect-SplitSD`): merge files
-   from all contributing backup spans. Collision on the same filename for the
-   same device across non-overlapping spans is flagged as a contamination anomaly
-   rather than silently resolved.
-4. Generate `last.txt` inside each device's P-Series directory pointing to
-   that device's SN (i.e., `_golden_YYYY-MM-DD/{SN}/P-Series/last.txt`
-   contains `{SN}`).
-5. Write `manifest.json` and `README.md`
-6. Run `Test-GoldenIntegrity` then `Test-GoldenContent` on the result.
+1. Partition backups into `CleanBackupNames` (Integrity ≠ 'Contaminated') and
+   `ContaminatedBackupNames` (Integrity = 'Contaminated').
+2. For each device (or specified subset):
+   a. **Pass 1 — gather from clean backups**: Collect all files attributed to that device
+      across all clean backups. Attribution comes from EDF header SN (Trilogy files),
+      filename SN (EL_ CSV, BIN), or folder path (P-Series/{SN}/).
+      Group by (device SN + relative filename). For each group, pick largest (most
+      complete tip). Verify each EDF header SN matches the target device.
+   b. **Pass 2 — salvage from contaminated backups**: For Trilogy EDF files in any
+      contaminated backup, read the EDF header; include the file only if the header SN
+      affirmatively equals the target device SN. For P-Series files, path-based
+      `P-Series/{SN}/` attribution is sufficient. Each salvaged file is compared
+      against what Pass 1 found — largest wins. Log as `SalvagedFromContaminated`.
+   c. **Rewind**: Apply the Rewind Algorithm (see above) to the gathered set.
+      Orphaned pairs, WD/EL_ files for months without a complete pair, and invalid
+      steering files are dropped or replaced before any copy. Log each event.
+   d. **IMPORTANT**: The same filename (e.g. AD_202408_000.edf) may exist for
+      DIFFERENT devices — SN filtering in step (a) prevents cross-device mixing.
+      Never group by filename alone.
+   e. Copy the rewound set into `_golden_YYYY-MM-DD/{SN}/Trilogy/` and `.../P-Series/`
+3. For P-Series: steering files (FILES.SEQ, TRANSMITFILE.SEQ, SL_SAPPHIRE.json, prop.txt)
+   use largest-wins — equivalent to the most recent monotonically-growing version.
+   Ring buffer slots (P0-P7): collect ALL unique files from ALL backups since the ring
+   buffer is circular and older backups may hold sessions since overwritten on the SD card.
+4. If device is flagged `SplitSD = $true` (see `Find-SplitSD`): merge files from all
+   contributing backup spans. Collision on the same filename for the same device across
+   non-overlapping spans is flagged as a contamination anomaly rather than silently resolved.
+5. Generate `last.txt` inside each device's P-Series directory pointing to that device's
+   SN (i.e., `_golden_YYYY-MM-DD/{SN}/P-Series/last.txt` contains `{SN}`).
+6. Write `manifest.json` (includes per-device `rewindLog`) and `README.md`.
+7. Run `Test-GoldenIntegrity` then `Test-GoldenContent` on the result.
    Both results are printed to the console. Issues do not block the return;
    the golden path is returned to the caller regardless.
 
@@ -330,7 +376,7 @@ Builds an incremental golden.
 7. Write new `manifest.json` referencing the previous golden
 8. Run `Test-GoldenIntegrity` then `Test-GoldenContent`; print results to console
 
-### `Detect-SplitSD -TOC <obj>` (VBM-Analyzer.psm1)
+### `Find-SplitSD -TOC <obj>` (VBM-Analyzer.psm1)
 
 Analyses device data across all clean backups to identify SNs that appear to have
 come from two separate SD cards (non-overlapping date ranges).
@@ -379,8 +425,21 @@ BlowerHours guard prevents false positives where a device was legitimately offli
       "sourceFolders": ["12.1.2025", "4.10.2024"],
       "splitSD": false,
       "splitSDSpans": null,
-      "fileHashes": { "Trilogy/AD_202303_000.edf": "A1B2C3...", "..." : "..." }
+      "fileHashes": { "Trilogy/AD_202303_000.edf": "A1B2C3...", "..." : "..." },
+      "rewindLog": [
+        {
+          "Action": "DroppedOrphan",
+          "File": "Trilogy/AD_202408_000.edf",
+          "Reason": "AD_202408_000.edf has no matching DD_202408_000.edf in any source backup (partial SD flush)"
+        },
+        {
+          "Action": "SalvagedFromContaminated",
+          "File": "Trilogy/AD_202408_001.edf",
+          "Reason": "EDF header SN confirmed as TVXX0000001 in contaminated backup '12.1.2025.002'; file included in golden"
+        }
+      ]
     },
+    "_note_rewindLog": "rewindLog is an array of rewind/salvage events per device. Empty array means no action was needed. Actions: DroppedOrphan, ReplacedInvalid, DroppedInvalid, SalvagedFromContaminated."
     "TVXX0000004": {
       "splitSD": true,
       "splitSDSpans": [
@@ -395,7 +454,11 @@ BlowerHours guard prevents false positives where a device was legitimately offli
 ### `Test-GoldenIntegrity -GoldenPath <path>`
 Fast hash-and-existence pass. Verifies every file listed in `manifest.json` is
 present on disk with a matching MD5 hash, and that each EDF file's embedded SN
-matches its device folder. Also checks AD/DD pair completeness within `Trilogy/`.
+matches its device folder. **Does not check AD/DD pair completeness** — that is
+`Test-GoldenContent`'s responsibility, where missing pairs are reported as
+`EdfPairing` **Errors** (not Warnings). Because the rewind step ensures every golden
+is self-consistent, an EdfPairing problem in a golden indicates the rewind failed or
+was bypassed — it is an archive-integrity problem, not merely a source-data gap.
 
 Returns `PSCustomObject @{ Passed; FileCount; Failures }`.
 
@@ -419,7 +482,7 @@ Deep format and DirectView-compatibility validation. Scans every file in the gol
                        'PSeriesFormat' | 'ManifestSchema' | 'DirectoryStructure'
             Device   = 'TVXX0000001'   # device folder (SN), empty for manifest-level issues
             File     = 'Trilogy/AD_202303_000.edf'  # relative path within device folder
-            Message  = 'HeaderBytes is 512, expected 256'
+            Message  = 'HeaderBytes is 300, expected a positive multiple of 256 ((1 + num_signals) x 256)'
         }
     )
 }
@@ -432,8 +495,9 @@ Deep format and DirectView-compatibility validation. Scans every file in the gol
 2. Per-device directory structure: device folder, `Trilogy/`, `P-Series/` exist.
 3. DirectView compatibility gate: `P-Series/last.txt` present and matches SN,
    `P-Series/{SN}/prop.txt` present, at least one `AD_*.edf` in `Trilogy/`.
-4. EDF header fields: size ≥ 256, Version="0", HeaderBytes=256, StartDate/Time
-   format, NumDataRecords valid, NumSignals ≥ 1, RecordDuration non-negative,
+4. EDF header fields: size ≥ 256, Version="0", HeaderBytes a positive multiple of 256
+   (EDF spec: (1 + num_signals) × 256; observed values include 256, 512, 2560, 2816),
+   StartDate/Time format, NumDataRecords valid, NumSignals ≥ 1, RecordDuration non-negative,
    RecordingID SN matches device folder, filename YYYYMM consistent with StartDate.
 5. AD/DD pair completeness (thorough: both directions).
 6. BIN file filename-pattern parse; SN extracted from name matches device folder.
@@ -605,9 +669,9 @@ and is excluded from source control via `.gitignore`.
 ```
 Analyze:    BackupRoot → Get-BackupInventory → Get-BackupTOC → Show-TOC
                                              → Test-BackupIntegrity → Write-ContaminationReadme
-                                             → Detect-SplitSD (annotates TOC.Devices[*].SplitSD)
+                                             → Find-SplitSD (annotates TOC.Devices[*].SplitSD)
 
-Prepare:    BackupRoot → Get-BackupTOC → Detect-SplitSD
+Prepare:    BackupRoot → Get-BackupTOC → Find-SplitSD
 (wizard)               → Show-ForceDevicesPrompt
                           → [force=N] Show-DeviceSelection (suggest changed-or-new devices)
                           → [force=Y] use ForceDevices SNs + ForceReason
@@ -621,6 +685,9 @@ Compact:    BackupRoot → warn → Read-ValidatedPath (safety location)
                        → Invoke-SafetyBackup → Test-SafetyBackup
                        → Invoke-Compaction → Test-PostDedupIntegrity
                        → [on failure] Invoke-DedupRollback
+
+Validate:   BackupRoot → Get-BackupInventory → Get-BackupTOC → [user selects backup(s)]
+                       → Test-BackupIntegrity (per selected backup) → display anomalies
 ```
 
 ## Known Edge Cases & Regression Guards

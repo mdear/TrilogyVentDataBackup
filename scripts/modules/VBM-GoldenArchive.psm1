@@ -20,8 +20,18 @@ function _SortBackupsByDate {
 # Collect all Trilogy files for a device across the given (clean) backups,
 # grouped by filename. Returns hashtable: filename -> @{Path,Size,SN}
 function _GatherTrilogyFiles {
-    param([hashtable]$Backups, [string]$DeviceSN, [string[]]$CleanBackupNames)
-    $groups = @{}  # filename -> best-so-far {Path, Size, SN}
+    param(
+        [hashtable]$Backups,
+        [string]$DeviceSN,
+        [string[]]$CleanBackupNames,
+        # Contaminated backups to mine for files unambiguously attributable to DeviceSN
+        # via their embedded EDF header SN.  Non-EDF files are never salvaged from here.
+        [string[]]$ContaminatedBackupNames = @(),
+        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new())
+    )
+    $groups = @{}  # filename -> best-so-far {Path, Size, SN, BackupName, Salvaged}
+
+    # Pass 1 — clean backups (attribution via P-Series roster, confirmed by EDF header)
     foreach ($bName in $CleanBackupNames) {
         $b = $Backups[$bName]
         if (-not $b.Devices.ContainsKey($DeviceSN)) { continue }
@@ -34,14 +44,48 @@ function _GatherTrilogyFiles {
             $cur = $groups[$f.FileName]
             if (-not $cur -or $f.Size -gt $cur.Size) {
                 $groups[$f.FileName] = [PSCustomObject]@{
-                    Path     = $f.Path
-                    Size     = $f.Size
-                    SN       = $DeviceSN
+                    Path       = $f.Path
+                    Size       = $f.Size
+                    SN         = $DeviceSN
                     BackupName = $bName
+                    Salvaged   = $false
                 }
             }
         }
     }
+
+    # Pass 2 — contaminated backups: salvage files whose EDF header identifies DeviceSN
+    # Non-EDF files (BIN, EL_ CSV) use filename-based SN attribution which is unreliable
+    # in contaminated folders (TVXX0000004's files overwrite filenames), so they are skipped.
+    foreach ($bName in $ContaminatedBackupNames) {
+        $b = $Backups[$bName]
+        # Walk ALL devices in this backup — contaminated folders place a given device's
+        # EDF files under ANY SN key (whichever device the scanner first attributed them to),
+        # so we scan every device bucket and rely solely on the header SN as the truth.
+        foreach ($snKey in $b.Devices.Keys) {
+            foreach ($f in $b.Devices[$snKey].TrilogyFiles) {
+                if ($f.FileName -notmatch '\.edf$') { continue }  # EDF only — strict header check required
+                $headerSN = Get-EdfDeviceSerial -Path $f.Path
+                if ($headerSN -ne $DeviceSN) { continue }  # Must affirmatively match (not just not-wrong)
+                $cur = $groups[$f.FileName]
+                if (-not $cur -or $f.Size -gt $cur.Size) {
+                    $groups[$f.FileName] = [PSCustomObject]@{
+                        Path       = $f.Path
+                        Size       = $f.Size
+                        SN         = $DeviceSN
+                        BackupName = $bName
+                        Salvaged   = $true
+                    }
+                    $SalvageLog.Value.Add([PSCustomObject]@{
+                        Action = 'SalvagedFromContaminated'
+                        File   = "Trilogy/$($f.FileName)"
+                        Reason = "EDF header SN confirmed as $DeviceSN in contaminated backup '$bName'; file included in golden"
+                    })
+                }
+            }
+        }
+    }
+
     return $groups
 }
 
@@ -49,7 +93,13 @@ function _GatherTrilogyFiles {
 # - Steering files: most recent clean backup wins (they grow monotonically)
 # - Ring buffer (P0-P7): all unique files from all backups
 function _GatherPSeriesFiles {
-    param([hashtable]$Backups, [string]$DeviceSN, [string[]]$SortedCleanNames)
+    param(
+        [hashtable]$Backups,
+        [string]$DeviceSN,
+        [string[]]$SortedCleanNames,
+        [string[]]$ContaminatedBackupNames = @(),
+        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new())
+    )
     $steeringNames = @('prop.txt','FILES.SEQ','TRANSMITFILE.SEQ','SL_SAPPHIRE.json')
     $steering      = @{}   # FileName -> {Path, Size}
     $ringBuf       = @{}   # RelativePath-within-device-dir -> {Path, Size}
@@ -106,14 +156,330 @@ function _GatherPSeriesFiles {
             }
         }
     }
+
+    # Pass 2 — contaminated backups: salvage P-Series files for DeviceSN.
+    # P-Series folder structure (P-Series/{SN}/) unambiguously attributes files to a
+    # device by folder name, so no additional verification is needed.
+    # Steering files from contaminated backups are only used if no clean version exists
+    # or if the contaminated version is strictly larger (same "largest wins" rule).
+    foreach ($bName in $ContaminatedBackupNames) {
+        $b = $Backups[$bName]
+        if (-not $b.Devices.ContainsKey($DeviceSN)) { continue }
+        foreach ($pf in $b.Devices[$DeviceSN].PSeriesFiles) {
+            $fn  = $pf.FileName
+            $rel = $pf.RelativePath
+            $isRing = $rel -match '[/\\]P[0-7][/\\]'
+            if ($isRing) {
+                $ringKey = ($rel -replace '^P-Series[/\\][^/\\]+[/\\]', '') -replace '\\', '/'
+                $cur = $ringBuf[$ringKey]
+                if (-not $cur -or $pf.Size -gt $cur.Size) {
+                    $ringBuf[$ringKey] = [PSCustomObject]@{
+                        Path       = $pf.Path
+                        Size       = $pf.Size
+                        RingKey    = $ringKey
+                        BackupName = $bName
+                    }
+                    $SalvageLog.Value.Add([PSCustomObject]@{
+                        Action = 'SalvagedFromContaminated'
+                        File   = "P-Series/$DeviceSN/$ringKey"
+                        Reason = "P-Series path-based attribution confirmed $DeviceSN in contaminated backup '$bName'; ring-buffer entry included in golden"
+                    })
+                }
+            } elseif ($steeringNames -contains $fn) {
+                $cur = $steering[$fn]
+                if (-not $cur -or $pf.Size -gt $cur.Size) {
+                    $steering[$fn] = [PSCustomObject]@{
+                        Path       = $pf.Path
+                        Size       = $pf.Size
+                        BackupName = $bName
+                    }
+                    $SalvageLog.Value.Add([PSCustomObject]@{
+                        Action = 'SalvagedFromContaminated'
+                        File   = "P-Series/$DeviceSN/$fn"
+                        Reason = "P-Series path-based attribution confirmed $DeviceSN in contaminated backup '$bName'; steering file included in golden"
+                    })
+                }
+            }
+        }
+    }
+
     return @{ Steering = $steering; RingBuf = $ringBuf }
 }
 
 function _CopyFile {
-    param([string]$Source, [string]$Dest)
-    $dir = [System.IO.Path]::GetDirectoryName($Dest)
-    if (-not (Test-Path $dir)) { $null = New-Item -ItemType Directory -Path $dir -Force }
-    Copy-Item -LiteralPath $Source -Destination $Dest -Force
+    param([string]$Source, [string]$Destination)
+    # Normalize forward slashes to backslashes (ring-buffer keys use '/' as separator)
+    $Destination = $Destination.Replace('/', '\')
+    $Source      = $Source.Replace('/', '\')
+    $dir = [System.IO.Path]::GetDirectoryName($Destination)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path -LiteralPath $dir)) {
+        $null = New-Item -ItemType Directory -Path $dir -Force
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+}
+
+# Rewind Trilogy file set to the latest self-consistent state.
+#
+# Removal rules applied in order:
+#   1a. AD_YYYYMM_NNN without matching DD_YYYYMM_NNN → drop the orphaned AD
+#   1a. DD_YYYYMM_NNN without matching AD_YYYYMM_NNN → drop the orphaned DD
+#   1b. WD_YYYYMMDD_NNN whose YYYYMM has no complete AD+DD pair → drop the WD
+#   1c. EL_{SN}_{YYYYMMDD}.csv whose YYYYMM has no complete AD+DD pair → drop the EL_
+#
+# NNN sequence gaps (1d) are noted in the return value but do NOT trigger removal
+# because the surrounding files are internally self-consistent.
+#
+# Returns [PSCustomObject]@{
+#     Files          = cleaned hashtable (filename -> fileinfo)
+#     CompleteMonths = HashSet<string> of "YYYYMM" that have at least one complete AD+DD pair
+#     DroppedCount   = total number of files removed
+# }
+# RewindLog is a [ref] to a List<PSCustomObject>; each entry is logged there as well.
+function _RewindTrilogyFiles {
+    param(
+        [hashtable]$TrilogyGroups,
+        [ref]$RewindLog
+    )
+
+    $adKeys   = @{}   # "YYYYMM_NNN" -> filename
+    $ddKeys   = @{}
+    $wdFnames  = [System.Collections.Generic.List[string]]::new()
+    $elFnames  = [System.Collections.Generic.List[string]]::new()
+    # (BIN files and unknown files pass through without pairing checks)
+
+    foreach ($fname in $TrilogyGroups.Keys) {
+        if      ($fname -match '^AD_(\d{6}_\d{3})\.edf$') { $adKeys[$Matches[1]] = $fname }
+        elseif  ($fname -match '^DD_(\d{6}_\d{3})\.edf$') { $ddKeys[$Matches[1]] = $fname }
+        elseif  ($fname -match '^WD_\d{8}_\d{3}\.edf$')   { [void]$wdFnames.Add($fname)   }
+        elseif  ($fname -match '^EL_')                     { [void]$elFnames.Add($fname)   }
+    }
+
+    $toRemove       = [System.Collections.Generic.HashSet[string]]::new()
+    $completeMonths = [System.Collections.Generic.HashSet[string]]::new()
+
+    # Rule 1a — orphaned AD (no matching DD)
+    foreach ($key in $adKeys.Keys) {
+        if (-not $ddKeys.ContainsKey($key)) {
+            $fname = $adKeys[$key]
+            [void]$toRemove.Add($fname)
+            $RewindLog.Value.Add([PSCustomObject]@{
+                Action = 'DroppedOrphan'
+                File   = "Trilogy/$fname"
+                Reason = "AD_$key.edf has no matching DD_$key.edf in any source backup (partial SD flush)"
+            })
+        } else {
+            [void]$completeMonths.Add($key.Substring(0, 6))  # "YYYYMM"
+        }
+    }
+
+    # Rule 1a — orphaned DD (no matching AD)
+    foreach ($key in $ddKeys.Keys) {
+        if (-not $adKeys.ContainsKey($key)) {
+            $fname = $ddKeys[$key]
+            [void]$toRemove.Add($fname)
+            $RewindLog.Value.Add([PSCustomObject]@{
+                Action = 'DroppedOrphan'
+                File   = "Trilogy/$fname"
+                Reason = "DD_$key.edf has no matching AD_$key.edf in any source backup (partial SD flush)"
+            })
+        }
+    }
+
+    # Rule 1b — WD files whose month has no complete AD+DD pair
+    foreach ($fname in $wdFnames) {
+        if ($fname -match '^WD_(\d{6})\d{2}_\d{3}\.edf$') {
+            $month = $Matches[1]
+            if (-not $completeMonths.Contains($month)) {
+                [void]$toRemove.Add($fname)
+                $RewindLog.Value.Add([PSCustomObject]@{
+                    Action = 'DroppedOrphan'
+                    File   = "Trilogy/$fname"
+                    Reason = "WD file for month $month but no complete AD+DD pair exists for that month (partial SD flush)"
+                })
+            }
+        }
+    }
+
+    # Rule 1c — EL_ CSV files whose date-month has no complete AD+DD pair
+    foreach ($fname in $elFnames) {
+        if ($fname -match '^EL_[^_]+_(\d{6})\d{2}\.csv$') {
+            $month = $Matches[1]
+            if (-not $completeMonths.Contains($month)) {
+                [void]$toRemove.Add($fname)
+                $RewindLog.Value.Add([PSCustomObject]@{
+                    Action = 'DroppedOrphan'
+                    File   = "Trilogy/$fname"
+                    Reason = "EL_ event log for month $month but no complete AD+DD pair exists for that month (partial SD flush)"
+                })
+            }
+        }
+    }
+
+    $result = @{}
+    foreach ($fname in $TrilogyGroups.Keys) {
+        if (-not $toRemove.Contains($fname)) { $result[$fname] = $TrilogyGroups[$fname] }
+    }
+
+    return [PSCustomObject]@{
+        Files          = $result
+        CompleteMonths = $completeMonths
+        DroppedCount   = $toRemove.Count
+    }
+}
+
+# Rewind P-Series file set to the latest self-consistent state.
+#
+# Rules applied:
+#   2a. SL_SAPPHIRE.json: if the chosen copy is not syntactically valid JSON, fall back
+#       to the largest syntactically valid version across all clean backups.
+#   2b. prop.txt: if the chosen copy lacks a valid SN= line matching DeviceSN, fall back
+#       to the most recent backup whose prop.txt has a correct SN field.
+#   2c. PP JSON ring-buffer entries whose session month (from filename PP_YYYYMMDD_NNN.json)
+#       has no complete AD+DD pair → drop those entries.
+#       (Guard: if CompleteMonths is empty, no cutoff is imposed — keep all PP JSON.)
+#
+# Returns [PSCustomObject]@{ Steering = cleaned steering hashtable; RingBuf = cleaned ring hashtable }
+# RewindLog receives one entry per file removed or replaced.
+function _RewindPSeriesFiles {
+    param(
+        [hashtable]$Steering,
+        [hashtable]$RingBuf,
+        [System.Collections.Generic.HashSet[string]]$CompleteMonths,
+        [hashtable]$Backups,
+        [string]$DeviceSN,
+        [string[]]$SortedCleanNames,
+        [ref]$RewindLog
+    )
+
+    $newSteering = @{}
+
+    foreach ($fn in $Steering.Keys) {
+        $chosen = $Steering[$fn]
+
+        # Rule 2a — SL_SAPPHIRE.json must be valid JSON starting with '{'
+        if ($fn -eq 'SL_SAPPHIRE.json') {
+            $isValid = $false
+            try {
+                $raw = Get-Content -LiteralPath $chosen.Path -Raw -ErrorAction Stop
+                if ($raw -and $raw.Trim() -match '^\{') {
+                    $null = $raw | ConvertFrom-Json -ErrorAction Stop
+                    $isValid = $true
+                }
+            } catch { }
+
+            if (-not $isValid) {
+                # Find the largest valid SL_SAPPHIRE.json across all clean backups (newest first)
+                $fallback = $null
+                foreach ($bName in ($SortedCleanNames | Sort-Object -Descending)) {
+                    $b = $Backups[$bName]
+                    if (-not $b.Devices.ContainsKey($DeviceSN)) { continue }
+                    $pf = $b.Devices[$DeviceSN].PSeriesFiles |
+                          Where-Object { $_.FileName -eq 'SL_SAPPHIRE.json' } |
+                          Sort-Object Size -Descending |
+                          Select-Object -First 1
+                    if (-not $pf) { continue }
+                    try {
+                        $raw = Get-Content -LiteralPath $pf.Path -Raw -ErrorAction Stop
+                        if ($raw -and $raw.Trim() -match '^\{') {
+                            $null = $raw | ConvertFrom-Json -ErrorAction Stop
+                            $fallback = [PSCustomObject]@{ Path = $pf.Path; Size = $pf.Size; BackupName = $bName }
+                            break
+                        }
+                    } catch { }
+                }
+                if ($fallback) {
+                    $RewindLog.Value.Add([PSCustomObject]@{
+                        Action = 'ReplacedInvalid'
+                        File   = "P-Series/$DeviceSN/SL_SAPPHIRE.json"
+                        Reason = "SL_SAPPHIRE.json from '$($chosen.BackupName)' is not valid JSON (truncated write); using version from '$($fallback.BackupName)'"
+                    })
+                    $newSteering[$fn] = $fallback
+                } else {
+                    $RewindLog.Value.Add([PSCustomObject]@{
+                        Action = 'DroppedInvalid'
+                        File   = "P-Series/$DeviceSN/SL_SAPPHIRE.json"
+                        Reason = "SL_SAPPHIRE.json is not valid JSON in any source backup — omitted from golden"
+                    })
+                    # Omit from newSteering
+                }
+            } else {
+                $newSteering[$fn] = $chosen
+            }
+            continue
+        }
+
+        # Rule 2b — prop.txt must have a valid SN= line matching DeviceSN
+        if ($fn -eq 'prop.txt') {
+            $isValid = $false
+            try {
+                $lines = Get-Content -LiteralPath $chosen.Path -Encoding UTF8 -ErrorAction Stop
+                $snLine = $lines | Where-Object { $_ -match '^SN\s*=' } | Select-Object -First 1
+                if ($snLine -and ($snLine -split '=', 2)[1].Trim() -eq $DeviceSN) { $isValid = $true }
+            } catch { }
+
+            if (-not $isValid) {
+                # Find the most recent backup with a valid prop.txt for this device
+                $fallback = $null
+                foreach ($bName in ($SortedCleanNames | Sort-Object -Descending)) {
+                    $b = $Backups[$bName]
+                    if (-not $b.Devices.ContainsKey($DeviceSN)) { continue }
+                    $pf = $b.Devices[$DeviceSN].PSeriesFiles |
+                          Where-Object { $_.FileName -eq 'prop.txt' } |
+                          Select-Object -First 1
+                    if (-not $pf) { continue }
+                    try {
+                        $lines = Get-Content -LiteralPath $pf.Path -Encoding UTF8 -ErrorAction Stop
+                        $snLine = $lines | Where-Object { $_ -match '^SN\s*=' } | Select-Object -First 1
+                        if ($snLine -and ($snLine -split '=', 2)[1].Trim() -eq $DeviceSN) {
+                            $fallback = [PSCustomObject]@{ Path = $pf.Path; Size = $pf.Size; BackupName = $bName }
+                            break
+                        }
+                    } catch { }
+                }
+                if ($fallback) {
+                    $RewindLog.Value.Add([PSCustomObject]@{
+                        Action = 'ReplacedInvalid'
+                        File   = "P-Series/$DeviceSN/prop.txt"
+                        Reason = "prop.txt from '$($chosen.BackupName)' has no valid SN=$DeviceSN line (truncated write); using version from '$($fallback.BackupName)'"
+                    })
+                    $newSteering[$fn] = $fallback
+                } else {
+                    # Keep the chosen version so the file isn't silently lost; let
+                    # Test-GoldenContent flag the format issue.
+                    $newSteering[$fn] = $chosen
+                }
+            } else {
+                $newSteering[$fn] = $chosen
+            }
+            continue
+        }
+
+        # All other steering files pass through unchanged
+        $newSteering[$fn] = $chosen
+    }
+
+    # Rule 2c — PP JSON entries for months with no committed AD+DD pair
+    $newRingBuf = @{}
+    foreach ($ringKey in $RingBuf.Keys) {
+        # Ring key format: "P3/PP_20250714_002.json" → extract YYYYMM from the filename portion
+        if ($CompleteMonths.Count -gt 0 -and $ringKey -match '/PP_(\d{6})\d{2}_') {
+            $month = $Matches[1]
+            if (-not $CompleteMonths.Contains($month)) {
+                $RewindLog.Value.Add([PSCustomObject]@{
+                    Action = 'DroppedOrphan'
+                    File   = "P-Series/$DeviceSN/$ringKey"
+                    Reason = "PP session for month $month has no committed AD+DD EDF pair (partial SD flush)"
+                })
+                continue
+            }
+        }
+        $newRingBuf[$ringKey] = $RingBuf[$ringKey]
+    }
+
+    return [PSCustomObject]@{
+        Steering = $newSteering
+        RingBuf  = $newRingBuf
+    }
 }
 
 function _WriteManifest {
@@ -127,14 +493,21 @@ function _BuildDeviceGolden {
         [string]$DeviceSN,
         [hashtable]$Backups,
         [string]$GoldenPath,
-        [string[]]$CleanBackupNames
+        [string[]]$CleanBackupNames,
+        [string[]]$ContaminatedBackupNames = @()
     )
     # Sort backups oldest-first so ring buffer key collisions prefer newer data
     $sortedNames = _SortBackupsByDate -Backups $Backups -DeviceSN $DeviceSN
+    $rewindLog   = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-    # Trilogy files
-    $triGroups  = _GatherTrilogyFiles -Backups $Backups -DeviceSN $DeviceSN -CleanBackupNames $CleanBackupNames
-    $trilogyDst = Join-Path $GoldenPath "$DeviceSN\Trilogy"
+    # Trilogy files — gather from clean backups then salvage from contaminated, then rewind
+    $rawTriGroups = _GatherTrilogyFiles -Backups $Backups -DeviceSN $DeviceSN `
+        -CleanBackupNames $CleanBackupNames `
+        -ContaminatedBackupNames $ContaminatedBackupNames `
+        -SalvageLog ([ref]$rewindLog)
+    $rewindTri    = _RewindTrilogyFiles -TrilogyGroups $rawTriGroups -RewindLog ([ref]$rewindLog)
+    $triGroups    = $rewindTri.Files
+    $trilogyDst   = Join-Path $GoldenPath "$DeviceSN\Trilogy"
 
     $triHashes   = @{}
     $sourceFolderSet = [System.Collections.Generic.HashSet[string]]::new()
@@ -146,9 +519,20 @@ function _BuildDeviceGolden {
         [void]$sourceFolderSet.Add($best.BackupName)
     }
 
-    # P-Series files
-    $psData      = _GatherPSeriesFiles -Backups $Backups -DeviceSN $DeviceSN -SortedCleanNames $sortedNames
-    $psDst       = Join-Path $GoldenPath "$DeviceSN\P-Series\$DeviceSN"
+    # P-Series files — gather from clean backups then salvage from contaminated, then rewind
+    $rawPsData = _GatherPSeriesFiles -Backups $Backups -DeviceSN $DeviceSN `
+        -SortedCleanNames $sortedNames `
+        -ContaminatedBackupNames $ContaminatedBackupNames `
+        -SalvageLog ([ref]$rewindLog)
+    $psData    = _RewindPSeriesFiles `
+        -Steering $rawPsData.Steering `
+        -RingBuf  $rawPsData.RingBuf `
+        -CompleteMonths $rewindTri.CompleteMonths `
+        -Backups $Backups `
+        -DeviceSN $DeviceSN `
+        -SortedCleanNames $sortedNames `
+        -RewindLog ([ref]$rewindLog)
+    $psDst     = Join-Path $GoldenPath "$DeviceSN\P-Series\$DeviceSN"
     $psHashes    = @{}
 
     # Steering files
@@ -172,7 +556,7 @@ function _BuildDeviceGolden {
 
     # last.txt — point to this device
     $lastTxtDst  = Join-Path $GoldenPath "$DeviceSN\P-Series\last.txt"
-    $null = New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($lastTxtDst)) -Force -ErrorAction SilentlyContinue
+    $null = New-Item -ItemType Directory -Path (Split-Path -Path $lastTxtDst -Parent) -Force -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $lastTxtDst -Value $DeviceSN -Encoding UTF8
 
     # Aggregate date range, model, and P-Series date range from all backups that observed this device
@@ -212,10 +596,11 @@ function _BuildDeviceGolden {
         PSeriesRange     = @{ Earliest = $psEarliest; Latest = $psLatest }
         TrilogyFileCount = $triGroups.Count
         PSeriesFileCount = $psData.Steering.Count + $psData.RingBuf.Count
-        SourceFolders    = $sourceFolderSet.ToArray()
+        SourceFolders    = @($sourceFolderSet)   # HashSet has no native ToArray(); @() enumerates it
         FileHashes       = $allHashes
         SplitSD          = $false   # default; caller may override from TOC annotation
         SplitSDSpans     = $null
+        RewindLog        = $rewindLog.ToArray()
     }
 }
 
@@ -258,7 +643,8 @@ function New-GoldenArchive {
     }
     $null = New-Item -ItemType Directory -Path $goldenPath -Force
 
-    $cleanNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
+    $cleanNames      = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
+    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' })
 
     # ForceDevices takes precedence over Devices and the algorithm's default
     $targetSNs = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
@@ -280,12 +666,23 @@ function New-GoldenArchive {
     $manifestDevices = @{}
     foreach ($sn in $targetSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
-        $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath -CleanBackupNames $cleanNames
+        $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
+            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames
 
-        # Propagate SplitSD annotation from TOC (set by Detect-SplitSD if called beforehand)
+        # Propagate SplitSD annotation from TOC (set by Find-SplitSD if called beforehand)
         $tocDev = if ($TOC.Devices.ContainsKey($sn)) { $TOC.Devices[$sn] } else { $null }
         $splitSD    = $tocDev -and $tocDev.PSObject.Properties['SplitSD'] -and $tocDev.SplitSD
         $splitSpans = if ($splitSD -and $tocDev.PSObject.Properties['SplitSDSpans']) { $tocDev.SplitSDSpans } else { $null }
+
+        if ($devResult.RewindLog.Count -gt 0) {
+            Write-Host "  Rewound $($devResult.RewindLog.Count) inconsistency/inconsistencies for $sn (partial SD flush)" -ForegroundColor Yellow
+            foreach ($evt in $devResult.RewindLog | Select-Object -First 10) {
+                Write-Host "    [$($evt.Action)] $($evt.File): $($evt.Reason)" -ForegroundColor DarkYellow
+            }
+            if ($devResult.RewindLog.Count -gt 10) {
+                Write-Host "    ... and $($devResult.RewindLog.Count - 10) more rewind events." -ForegroundColor DarkGray
+            }
+        }
 
         $manifestDevices[$sn] = @{
             model            = $devResult.Model
@@ -299,6 +696,7 @@ function New-GoldenArchive {
             splitSD          = $splitSD
             splitSDSpans     = $splitSpans
             fileHashes       = $devResult.FileHashes
+            rewindLog        = $devResult.RewindLog
         }
     }
 
@@ -330,6 +728,21 @@ function New-GoldenArchive {
         foreach ($f in $integrity.Failures | Select-Object -First 5) {
             Write-Host "  • $f" -ForegroundColor Red
         }
+    }
+
+    $content = Test-GoldenContent -GoldenPath $goldenPath
+    if ($content.Passed) {
+        Write-Host "Content validation: PASSED ($($content.FileCount) files inspected, $($content.WarningCount) warning(s))" -ForegroundColor Green
+    } else {
+        $totalIssues = $content.CriticalCount + $content.ErrorCount
+        Write-Host "Content validation: $totalIssues issue(s) — $($content.CriticalCount) Critical, $($content.ErrorCount) Error, $($content.WarningCount) Warning" -ForegroundColor Red
+    }
+    foreach ($issue in $content.Issues | Select-Object -First 15) {
+        $colour = switch ($issue.Severity) { 'Critical' { 'Red' } 'Error' { 'Yellow' } default { 'DarkYellow' } }
+        Write-Host "  [$($issue.Severity.ToUpper())] $($issue.Category) $($issue.Device) $($issue.File): $($issue.Message)" -ForegroundColor $colour
+    }
+    if ($content.Issues.Count -gt 15) {
+        Write-Host "  ... and $($content.Issues.Count - 15) more. Run Test-GoldenContent for the full report." -ForegroundColor DarkGray
     }
 
     return $goldenPath
@@ -364,7 +777,8 @@ function Update-GoldenArchive {
     $prevManifest = Get-Content $prevManifestPath -Raw | ConvertFrom-Json
 
     # Determine which devices have changed vs previous golden
-    $cleanNames   = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
+    $cleanNames        = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
+    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' })
     $changedSNs   = [System.Collections.Generic.List[string]]::new()
 
     if ($ForceDevices -and $ForceDevices.Count -gt 0) {
@@ -378,8 +792,9 @@ function Update-GoldenArchive {
         }
     } else {
         foreach ($sn in $TOC.Devices.Keys) {
-            # Compute current best hash for each file
-            $currentGroups = _GatherTrilogyFiles -Backups $TOC.Backups -DeviceSN $sn -CleanBackupNames $cleanNames
+            # Compute current best hash for each file (include contaminated backups for salvage)
+            $currentGroups = _GatherTrilogyFiles -Backups $TOC.Backups -DeviceSN $sn `
+                -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames
             $prevDevProp   = $prevManifest.devices.PSObject.Properties[$sn]
             $prevDevice    = if ($prevDevProp) { $prevDevProp.Value } else { $null }
 
@@ -425,11 +840,22 @@ function Update-GoldenArchive {
     $manifestDevices = @{}
     foreach ($sn in $changedSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
-        $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath -CleanBackupNames $cleanNames
+        $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
+            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames
 
         $tocDev = if ($TOC.Devices.ContainsKey($sn)) { $TOC.Devices[$sn] } else { $null }
         $splitSD    = $tocDev -and $tocDev.PSObject.Properties['SplitSD'] -and $tocDev.SplitSD
         $splitSpans = if ($splitSD -and $tocDev.PSObject.Properties['SplitSDSpans']) { $tocDev.SplitSDSpans } else { $null }
+
+        if ($devResult.RewindLog.Count -gt 0) {
+            Write-Host "  Rewound $($devResult.RewindLog.Count) inconsistency/inconsistencies for $sn (partial SD flush)" -ForegroundColor Yellow
+            foreach ($evt in $devResult.RewindLog | Select-Object -First 10) {
+                Write-Host "    [$($evt.Action)] $($evt.File): $($evt.Reason)" -ForegroundColor DarkYellow
+            }
+            if ($devResult.RewindLog.Count -gt 10) {
+                Write-Host "    ... and $($devResult.RewindLog.Count - 10) more rewind events." -ForegroundColor DarkGray
+            }
+        }
 
         $manifestDevices[$sn] = @{
             model            = $devResult.Model
@@ -443,6 +869,7 @@ function Update-GoldenArchive {
             splitSD          = $splitSD
             splitSDSpans     = $splitSpans
             fileHashes       = $devResult.FileHashes
+            rewindLog        = $devResult.RewindLog
         }
     }
 
@@ -473,6 +900,21 @@ function Update-GoldenArchive {
         }
     }
 
+    $content = Test-GoldenContent -GoldenPath $goldenPath
+    if ($content.Passed) {
+        Write-Host "Content validation: PASSED ($($content.FileCount) files inspected, $($content.WarningCount) warning(s))" -ForegroundColor Green
+    } else {
+        $totalIssues = $content.CriticalCount + $content.ErrorCount
+        Write-Host "Content validation: $totalIssues issue(s) — $($content.CriticalCount) Critical, $($content.ErrorCount) Error, $($content.WarningCount) Warning" -ForegroundColor Red
+    }
+    foreach ($issue in $content.Issues | Select-Object -First 15) {
+        $colour = switch ($issue.Severity) { 'Critical' { 'Red' } 'Error' { 'Yellow' } default { 'DarkYellow' } }
+        Write-Host "  [$($issue.Severity.ToUpper())] $($issue.Category) $($issue.Device) $($issue.File): $($issue.Message)" -ForegroundColor $colour
+    }
+    if ($content.Issues.Count -gt 15) {
+        Write-Host "  ... and $($content.Issues.Count - 15) more. Run Test-GoldenContent for the full report." -ForegroundColor DarkGray
+    }
+
     return $goldenPath
 }
 
@@ -483,7 +925,8 @@ function Update-GoldenArchive {
 function Test-GoldenIntegrity {
     <#
     .SYNOPSIS
-        Verify every file in the manifest exists, hashes match, EDF SN correct.
+        Verify every file in the manifest exists, hashes match, and EDF SN is correct.
+        Checks archive integrity only — not data completeness (pair coverage is Test-GoldenContent's domain).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$GoldenPath)
@@ -523,22 +966,6 @@ function Test-GoldenIntegrity {
                 $headerSN = Get-EdfDeviceSerial -Path $fullPath
                 if ($headerSN -and $headerSN -ne $sn) {
                     $failures.Add("SN MISMATCH in EDF header: $fullPath (manifest says $sn, header says $headerSN)")
-                }
-            }
-        }
-
-        # AD/DD pair completeness check
-        $trilogyPath = Join-Path $GoldenPath "$sn\Trilogy"
-        if (Test-Path $trilogyPath) {
-            $adFiles = @(Get-ChildItem -LiteralPath $trilogyPath -Filter 'AD_*.edf' | ForEach-Object {
-                if ($_.Name -match '^AD_(\d{6}_\d{3})\.edf$') { $Matches[1] }
-            })
-            $ddFiles = @(Get-ChildItem -LiteralPath $trilogyPath -Filter 'DD_*.edf' | ForEach-Object {
-                if ($_.Name -match '^DD_(\d{6}_\d{3})\.edf$') { $Matches[1] }
-            })
-            foreach ($key in $adFiles) {
-                if ($ddFiles -notcontains $key) {
-                    $failures.Add("MISSING DD PAIR for AD_$($key).edf in $sn")
                 }
             }
         }
@@ -592,7 +1019,7 @@ function Test-GoldenContent {
     $manifestPath = Join-Path $GoldenPath 'manifest.json'
     if (-not (Test-Path $manifestPath)) {
         return [PSCustomObject]@{
-            Passed='$false'; FileCount=0; CriticalCount=1; ErrorCount=0; WarningCount=0
+            Passed=$false; FileCount=0; CriticalCount=1; ErrorCount=0; WarningCount=0
             Issues=@((_NewContentIssue 'Critical' 'ManifestSchema' '' 'manifest.json' 'manifest.json not found'))
         }
     }
@@ -742,8 +1169,8 @@ function Test-GoldenContent {
                 if ($hdr.Version -ne '0') {
                     $issues.Add((_NewContentIssue 'Error' 'EdfFormat' $sn $relFile "Version field is '$($hdr.Version)', expected '0'"))
                 }
-                if ($hdr.HeaderBytes -ne 256) {
-                    $issues.Add((_NewContentIssue 'Error' 'EdfFormat' $sn $relFile "HeaderBytes is $($hdr.HeaderBytes), expected 256"))
+                if ($hdr.HeaderBytes -lt 256 -or $hdr.HeaderBytes % 256 -ne 0) {
+                    $issues.Add((_NewContentIssue 'Error' 'EdfFormat' $sn $relFile "HeaderBytes is $($hdr.HeaderBytes), expected a positive multiple of 256 ((1 + num_signals) x 256)"))
                 }
                 if ($hdr.StartDate -and $hdr.StartDate -notmatch '^\d{2}\.\d{2}\.\d{2}$') {
                     $issues.Add((_NewContentIssue 'Warning' 'EdfFormat' $sn $relFile "StartDate '$($hdr.StartDate)' does not match expected dd.mm.yy format"))
@@ -793,14 +1220,16 @@ function Test-GoldenContent {
             }
 
             # AD/DD pair completeness (bidirectional)
+            # After the rewind step in _BuildDeviceGolden, no golden should contain orphaned pairs.
+            # If any remain, that indicates archive tampering or a rewind logic bug — report as Error.
             foreach ($k in @($adKeys.Keys)) {
                 if (-not $ddKeys.ContainsKey($k)) {
-                    $issues.Add((_NewContentIssue 'Warning' 'EdfPairing' $sn "Trilogy/AD_$k.edf" "AD_$k.edf has no matching DD_$k.edf"))
+                    $issues.Add((_NewContentIssue 'Error' 'EdfPairing' $sn "Trilogy/AD_$k.edf" "AD_$k.edf has no matching DD_$k.edf — golden was not properly rewound"))
                 }
             }
             foreach ($k in @($ddKeys.Keys)) {
                 if (-not $adKeys.ContainsKey($k)) {
-                    $issues.Add((_NewContentIssue 'Warning' 'EdfPairing' $sn "Trilogy/DD_$k.edf" "DD_$k.edf has no matching AD_$k.edf"))
+                    $issues.Add((_NewContentIssue 'Error' 'EdfPairing' $sn "Trilogy/DD_$k.edf" "DD_$k.edf has no matching AD_$k.edf — golden was not properly rewound"))
                 }
             }
 
@@ -980,5 +1409,6 @@ function _WriteGoldenReadme {
 Export-ModuleMember -Function @(
     'New-GoldenArchive',
     'Update-GoldenArchive',
-    'Test-GoldenIntegrity'
+    'Test-GoldenIntegrity',
+    'Test-GoldenContent'
 )

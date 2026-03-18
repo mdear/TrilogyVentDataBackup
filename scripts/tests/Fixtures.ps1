@@ -25,11 +25,16 @@ function New-SyntheticEdf {
     .PARAMETER ExtraBodyBytes
         Bytes appended after the 256-byte header (default 256 -> 512-byte total file).
         Increase this value to simulate a "larger" version of the same file for truncation tests.
+    .PARAMETER HeaderBytesValue
+        Value written into the EDF HeaderBytes field (offset 184). Use 256 for standard EDF
+        and 512 for the extended EDF+ variant seen on some newer device firmware generations.
+        Default is 256.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
-        [string]$SN             = 'TVXX0000001',
-        [int]   $ExtraBodyBytes = 256
+        [string]$SN               = 'TVXX0000001',
+        [int]   $ExtraBodyBytes   = 256,
+        [int]   $HeaderBytesValue = 256
     )
     $dir = [System.IO.Path]::GetDirectoryName($Path)
     if ($dir -and -not (Test-Path $dir)) {
@@ -47,12 +52,19 @@ function New-SyntheticEdf {
         [Array]::Copy($src, 0, $bytes, $Off, $Len)
     }
 
+    # Derive StartDate month from the filename (e.g. AD_202408_000.edf -> '01.08.24')
+    # so the validator's filename-month vs header-month check passes.
+    $startDate = '01.01.24'
+    if ([System.IO.Path]::GetFileName($Path) -match '_(\d{4})(\d{2})_') {
+        $startDate = "01.$($Matches[2]).$($Matches[1].Substring(2))"
+    }
+
     # EDF fixed-format header fields (offsets per ARCHITECTURE.md spec)
     & $stamp '0'                                                               0    8   # Version
     & $stamp "Startdate 01-JAN-2024 X X TGY200 0 $SN CA1032800B 65 3.02"    88   80   # RecordingID
-    & $stamp '01.01.24'                                                      168    8   # StartDate
+    & $stamp $startDate                                                      168    8   # StartDate
     & $stamp '00.00.00'                                                      176    8   # StartTime
-    & $stamp '256'                                                           184    8   # HeaderBytes
+    & $stamp "$HeaderBytesValue"                                             184    8   # HeaderBytes
     & $stamp '-1'                                                            236    8   # NumDataRecords (-1 = active recording, per spec)
     & $stamp '1'                                                             244    8   # RecordDuration
     & $stamp '1'                                                             252    4   # NumSignals

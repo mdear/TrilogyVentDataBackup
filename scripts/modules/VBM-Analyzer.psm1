@@ -173,6 +173,21 @@ function Get-BackupInventory {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$BackupRoot)
 
+    # ── Edge case 19: Dropbox Smart Sync warning ───────────────────────────
+    # Files may be "online only" and inaccessible. Warn so the user can make
+    # them available offline before scanning (per DESIGN.md edge case 19).
+    $dbCheck = $BackupRoot
+    while ($dbCheck -and $dbCheck -ne (Split-Path $dbCheck -Parent)) {
+        if ((Test-Path (Join-Path $dbCheck '.dropbox')) -or
+            (Test-Path (Join-Path $dbCheck '.dropbox.cache'))) {
+            Write-Warning 'BackupRoot appears to be inside a Dropbox-synced folder.'
+            Write-Warning 'Files that are "online only" (Dropbox Smart Sync) will be silently'
+            Write-Warning 'skipped during scanning. Make all files available offline first.'
+            break
+        }
+        $dbCheck = Split-Path $dbCheck -Parent
+    }
+
     $results = [System.Collections.Generic.List[object]]::new()
 
     foreach ($item in Get-ChildItem -LiteralPath $BackupRoot -Directory -ErrorAction SilentlyContinue) {
@@ -356,15 +371,47 @@ function Test-BackupIntegrity {
         foreach ($sn in $devices.Keys) { [void]$expectedSnSet.Add($sn) }
     }
 
-    # ── 1. Contamination: EDF files whose SN is not in expected set ────────
+    # ── Cross-backup check for .NNN variant backups (DESIGN.md §7) ────────
+    # Per DESIGN.md: "cross-reference against the clean copy of the same backup
+    # if one exists (e.g., 12.1.2025 vs 12.1.2025.002)".
+    # Contamination can also pollute the P-Series folder (the contaminating SD
+    # card's P-Series subdir gets merged in), so the expected-set check above
+    # cannot detect it alone. Solution: if this backup is named {base}.NNN,
+    # find {base} in the TOC, build its P-Series device set, and treat any SN
+    # present here but absent from {base} as a contaminating device.
+    $taintedSnSet = [System.Collections.Generic.HashSet[string]]::new()
+    if ($backupName -match '^(.+)\.\d{3}$') {
+        $baseName = $Matches[1]
+        if ($TOC.Backups.ContainsKey($baseName)) {
+            $baseDevices = $TOC.Backups[$baseName].Devices
+            $baseSnSet   = [System.Collections.Generic.HashSet[string]]::new()
+            foreach ($sn in $baseDevices.Keys) {
+                $hasProp = $baseDevices[$sn].PSeriesFiles | Where-Object { $_.FileName -eq 'prop.txt' }
+                if ($hasProp) { [void]$baseSnSet.Add($sn) }
+            }
+            foreach ($sn in @($expectedSnSet)) {
+                if (-not $baseSnSet.Contains($sn)) { [void]$taintedSnSet.Add($sn) }
+            }
+        }
+    }
+
+    # ── 1. Contamination: EDF files whose SN is not in expected set,
+    #       OR whose SN was injected relative to the base backup ───────────
     foreach ($sn in $devices.Keys) {
-        if ($expectedSnSet.Count -gt 0 -and -not $expectedSnSet.Contains($sn)) {
+        $notExpected = $expectedSnSet.Count -gt 0 -and -not $expectedSnSet.Contains($sn)
+        $tainted     = $taintedSnSet.Contains($sn)
+        if ($notExpected -or $tainted) {
+            $detail = if ($tainted) {
+                "Device $sn is present in P-Series here but absent from base backup '$($backupName -replace '\.\d{3}$','')' — its SD card data was likely merged into this folder"
+            } else {
+                "SN in EDF header ($sn) not found in P-Series roster ($($expectedSnSet -join ', '))"
+            }
             foreach ($f in $devices[$sn].TrilogyFiles) {
                 $anomalies.Add([PSCustomObject]@{
                     Type       = 'Contamination'
                     Severity   = 'High'
                     File       = $f.Path
-                    Detail     = "SN in EDF header ($sn) not found in P-Series roster ($($expectedSnSet -join ', '))"
+                    Detail     = $detail
                     Suggestion = "Verify against clean backup; this file may have overwritten a different device's data"
                 })
             }
@@ -389,7 +436,7 @@ function Test-BackupIntegrity {
                 Type       = 'MissingPair'
                 Severity   = 'Low'
                 File       = $f.Path
-                Detail     = "AD file '$($f.FileName)' has no matching DD_ file for same SN/month/sequence"
+                Detail     = "AD file '$($f.FileName)' (device $($f.SN)) has no matching DD_ file for same SN/month/sequence"
                 Suggestion = "Check other backups for the matching DD file"
             })
         }
@@ -401,7 +448,7 @@ function Test-BackupIntegrity {
                 Type       = 'MissingPair'
                 Severity   = 'Low'
                 File       = $f.Path
-                Detail     = "DD file '$($f.FileName)' has no matching AD_ file for same SN/month/sequence"
+                Detail     = "DD file '$($f.FileName)' (device $($f.SN)) has no matching AD_ file for same SN/month/sequence"
                 Suggestion = "Check other backups for the matching AD file"
             })
         }
@@ -447,7 +494,7 @@ function Test-BackupIntegrity {
                     Type       = 'PSeriesConsistency'
                     Severity   = 'Medium'
                     File       = $fsPath
-                    Detail     = "FILES.SEQ ($($fs.LineCount) entries) has fewer entries than TRANSMITFILE.SEQ ($($tx.LineCount)); FILES.SEQ must be a superset"
+                    Detail     = "FILES.SEQ ($($fs.LineCount) entries) has fewer entries than TRANSMITFILE.SEQ ($($tx.LineCount)) for device $sn; FILES.SEQ must be a superset"
                     Suggestion = "FILES.SEQ may have been partially copied"
                 })
             }
@@ -455,34 +502,48 @@ function Test-BackupIntegrity {
     }
 
     # ── 5. Size regression on monotonically growing P-Series files ─────────
-    $growingFiles = @('FILES.SEQ', 'TRANSMITFILE.SEQ', 'SL_SAPPHIRE.json')
+    # Report when another backup has a larger version of the same file for the same device.
+    # .NNN variant backups of the current backup (e.g. "12.1.2025.002" when current is
+    # "12.1.2025") are expected to be larger — skip them to avoid false positives.
+    $growingFiles      = @('FILES.SEQ', 'TRANSMITFILE.SEQ', 'SL_SAPPHIRE.json')
+    $nnnVariantPattern = '^' + [regex]::Escape($backupName) + '\.\d{3}$'
     foreach ($sn in $devices.Keys) {
         $psFiles = $devices[$sn].PSeriesFiles
         foreach ($gf in $growingFiles) {
             $thisEntry = $psFiles | Where-Object { $_.FileName -eq $gf } | Select-Object -First 1
             if (-not $thisEntry) { continue }
+            # Find the backup with the MAXIMUM file size, ignoring .NNN variants of this backup
+            $maxEntry      = $null
+            $maxBackupName = $null
             foreach ($otherName in $TOC.Backups.Keys) {
-                if ($otherName -eq $backupName) { continue }
+                if ($otherName -eq $backupName)          { continue }
+                if ($otherName -match $nnnVariantPattern) { continue }   # skip variants of current
                 $other = $TOC.Backups[$otherName]
                 if (-not $other.Devices.ContainsKey($sn)) { continue }
                 $otherEntry = $other.Devices[$sn].PSeriesFiles |
                               Where-Object { $_.FileName -eq $gf } |
                               Select-Object -First 1
                 if ($otherEntry -and $otherEntry.Size -gt $thisEntry.Size) {
-                    $anomalies.Add([PSCustomObject]@{
-                        Type       = 'SizeRegression'
-                        Severity   = 'Medium'
-                        File       = $thisEntry.Path
-                        Detail     = "$gf is $($thisEntry.Size) bytes; backup '$otherName' has larger version at $($otherEntry.Size) bytes (should grow monotonically)"
-                        Suggestion = "This backup may have a partial or earlier copy of $gf"
-                    })
-                    break
+                    if (-not $maxEntry -or $otherEntry.Size -gt $maxEntry.Size) {
+                        $maxEntry      = $otherEntry
+                        $maxBackupName = $otherName
+                    }
                 }
+            }
+            if ($maxEntry) {
+                $contaminNote = if ($TOC.Backups[$maxBackupName].Integrity -eq 'Contaminated') { ' [contaminated]' } else { '' }
+                $anomalies.Add([PSCustomObject]@{
+                    Type       = 'SizeRegression'
+                    Severity   = 'Medium'
+                    File       = $thisEntry.Path
+                    Detail     = "$gf is $($thisEntry.Size) bytes (device $sn); backup '$maxBackupName'$contaminNote has a larger version at $($maxEntry.Size) bytes"
+                    Suggestion = "A larger version of $gf exists in another backup — this copy may be from an earlier date or may be truncated"
+                })
             }
         }
     }
 
-    $isContaminated = ($anomalies | Where-Object { $_.Type -eq 'Contamination' }).Count -gt 0
+    $isContaminated = @($anomalies | Where-Object { $_.Type -eq 'Contamination' }).Count -gt 0
     return [PSCustomObject]@{
         Integrity = if ($isContaminated) { 'Contaminated' } else { 'Clean' }
         Anomalies = $anomalies.ToArray()
@@ -673,11 +734,17 @@ function Show-TOC {
         foreach ($b in $contaminated) {
             $cnt = ($b.Anomalies | Where-Object { $_.Type -eq 'Contamination' }).Count
             Write-Host "  Backup '$($b.Name)': $cnt contaminated file(s)" -ForegroundColor Red
-            foreach ($a in ($b.Anomalies | Where-Object { $_.Type -eq 'Contamination' } | Select-Object -First 3)) {
-                Write-Host "    • $($a.Detail)" -ForegroundColor Red
+            # Group by unique detail text so each distinct reason appears once with its file count
+            $groups = @($b.Anomalies | Where-Object { $_.Type -eq 'Contamination' } |
+                        Group-Object Detail | Sort-Object { -$_.Count })
+            $shownFiles = 0
+            foreach ($grp in $groups | Select-Object -First 3) {
+                $countNote = if ($grp.Count -gt 1) { " ($($grp.Count) files)" } else { '' }
+                Write-Host "    • $($grp.Name)$countNote" -ForegroundColor Red
+                $shownFiles += $grp.Count
             }
-            if ($cnt -gt 3) {
-                Write-Host "    ... and $($cnt - 3) more. Run Analyze to generate full report." -ForegroundColor Red
+            if ($cnt -gt $shownFiles) {
+                Write-Host "    ... and $($cnt - $shownFiles) more. Run Analyze to generate full report." -ForegroundColor Red
             }
         }
         Write-Host ''
@@ -686,9 +753,9 @@ function Show-TOC {
 
 #endregion
 
-#region ── Detect-SplitSD ────────────────────────────────────────────────────
+#region ── Find-SplitSD ─────────────────────────────────────────────────────
 
-function Detect-SplitSD {
+function Find-SplitSD {
     <#
     .SYNOPSIS
         Analyse TOC to detect device SNs that appear to have come from two or more
@@ -807,7 +874,7 @@ function Detect-SplitSD {
                     }
                 } else {
                     # No PP JSON data — emit a warning but still flag based on date gap
-                    Write-Warning "Detect-SplitSD: No PP JSON BlowerHours data for SN '$sn' — using date gap heuristic only (less reliable)"
+                    Write-Warning "Find-SplitSD: No PP JSON BlowerHours data for SN '$sn' — using date gap heuristic only (less reliable)"
                 }
 
                 if ($splitConfirmed) {
@@ -874,5 +941,5 @@ Export-ModuleMember -Function @(
     'Get-DeviceTimeline',
     'Write-ContaminationReadme',
     'Show-TOC',
-    'Detect-SplitSD'
+    'Find-SplitSD'
 )

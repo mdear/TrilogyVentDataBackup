@@ -31,7 +31,7 @@ function Import-SDCard {
 
     # Identify active device from last.txt
     $activeSN = $null
-    $lastTxtPath = Join-Path $Source 'P-Series' 'last.txt'
+    $lastTxtPath = Join-Path (Join-Path $Source 'P-Series') 'last.txt'
     if (Test-Path $lastTxtPath) {
         $activeSN = (Get-Content $lastTxtPath -Raw).Trim()
     }

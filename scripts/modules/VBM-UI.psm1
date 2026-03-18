@@ -5,28 +5,36 @@
 function Show-MainMenu {
     <#
     .SYNOPSIS
-        Display the main wizard menu and return the user's choice (1-6) or 0 to quit.
+        Display the main wizard menu and return the user's choice (1-7) or 0 to quit.
+    .PARAMETER BackupRoot
+        When supplied, the current backup root is shown beneath the title bar.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [string]$BackupRoot
+    )
 
     Write-Host ''
     Write-Host ('═' * 65) -ForegroundColor Cyan
     Write-Host '  VENT BACKUP MANAGER' -ForegroundColor Cyan
     Write-Host ('═' * 65) -ForegroundColor Cyan
+    if ($BackupRoot) {
+        Write-Host "  Root: $BackupRoot" -ForegroundColor DarkGray
+    }
     Write-Host ''
     Write-Host '  1) Analyze        — Scan all backups, show table of contents'
     Write-Host '  2) Prepare        — Build golden archive and export to SD card'
     Write-Host '  3) Golden Archive — Build / update the verified archive only'
     Write-Host '  4) Back Up SD     — Copy SD card into a new timestamped backup'
     Write-Host '  5) Compact        — Deduplicate backups (NTFS hardlinks)'
-    Write-Host '  6) Contamination  — Generate contamination README for a backup'
+    Write-Host '  6) Validate       — Check integrity of backup(s) and/or golden archive(s)'
+    Write-Host '  7) Settings       — Change backup root directory'
     Write-Host ''
     Write-Host '  Q) Quit'
     Write-Host ''
     do {
         $choice = (Read-Host 'Choose an option').Trim().ToUpperInvariant()
-    } while ($choice -notin @('1','2','3','4','5','6','Q'))
+    } while ($choice -notin @('1','2','3','4','5','6','7','Q'))
 
     if ($choice -eq 'Q') { return 0 }
     return [int]$choice
@@ -59,6 +67,60 @@ function Read-ValidatedPath {
             continue
         }
         return $raw
+    }
+}
+
+#endregion
+
+#region ── Show-SourcePicker ─────────────────────────────────────────────────
+
+function Show-SourcePicker {
+    <#
+    .SYNOPSIS
+        Display available drives and let the user pick a source path,
+        or enter any folder path manually (useful when SD card contents
+        were already copied to a local folder).
+    .OUTPUTS
+        [string] The selected or entered path.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # Enumerate ready drives (removable first, then others)
+    $drives = [System.IO.DriveInfo]::GetDrives() |
+              Where-Object { $_.IsReady } |
+              Sort-Object { $_.DriveType -ne 'Removable' }, Name
+
+    Write-Host ''
+    Write-Host '  Available drives:' -ForegroundColor Cyan
+    $i = 0
+    $indexed = foreach ($d in $drives) {
+        $i++
+        $label = if ($d.VolumeLabel) { "($($d.VolumeLabel))" } else { '' }
+        $type  = $d.DriveType
+        Write-Host ("  [{0}] {1}  {2,-12} {3}" -f $i, $d.RootDirectory.FullName, $type, $label)
+        [pscustomobject]@{ Index = $i; Path = $d.RootDirectory.FullName }
+    }
+    Write-Host '  [M] Enter a path manually (e.g. a local folder copy of the SD card)'
+    Write-Host ''
+
+    while ($true) {
+        $answer = (Read-Host '  Select drive number or M for manual').Trim().ToUpperInvariant()
+        if ($answer -eq 'M') {
+            $raw = (Read-Host '  Source path').Trim().Trim('"', "'")
+            if (-not $raw) { Write-Host '  Path cannot be empty.' -ForegroundColor Yellow; continue }
+            $raw = $raw -replace '^~', $HOME
+            if (-not (Test-Path $raw)) {
+                Write-Host "  Path not found: $raw" -ForegroundColor Yellow; continue
+            }
+            return $raw
+        }
+        $n = 0
+        if ([int]::TryParse($answer, [ref]$n)) {
+            $entry = $indexed | Where-Object { $_.Index -eq $n }
+            if ($entry) { return $entry.Path }
+        }
+        Write-Host '  Invalid selection.' -ForegroundColor Yellow
     }
 }
 
@@ -110,10 +172,10 @@ function Show-DeviceSelection {
         [string[]]$Suggested
     )
 
-    $snList = @($Devices.PSObject.Properties | ForEach-Object { $_.Name })
-    if ($snList.Count -eq 0) {
-        # Hashtable support
-        if ($Devices -is [hashtable]) { $snList = @($Devices.Keys) }
+    $snList = if ($Devices -is [hashtable]) {
+        @($Devices.Keys)
+    } else {
+        @($Devices.PSObject.Properties | ForEach-Object { $_.Name })
     }
     $snList = @($snList | Sort-Object)
 
@@ -392,6 +454,7 @@ function Show-ForceDevicesPrompt {
 
 Export-ModuleMember -Function @(
     'Show-MainMenu',
+    'Show-SourcePicker',
     'Read-ValidatedPath',
     'Read-YesNo',
     'Show-DeviceSelection',

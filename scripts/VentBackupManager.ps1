@@ -56,7 +56,7 @@ function _RunAnalyze {
     param([string]$Root)
     $Root = _ResolveBackupRoot $Root
     Write-Host "Scanning backup root: $Root" -ForegroundColor Cyan
-    $inv = Get-BackupInventory -BackupRoot $Root
+    $inv = @(Get-BackupInventory -BackupRoot $Root)
     if ($inv.Count -eq 0) {
         Write-Host "No backup folders found in: $Root" -ForegroundColor Yellow
         return $null
@@ -70,6 +70,9 @@ function _RunAnalyze {
     Write-Host ''   # newline after progress bar
     Show-TOC -TOC $toc
 
+    # Detect split SD cards (annotates TOC.Devices[*].SplitSD for golden selection)
+    $null = Find-SplitSD -TOC $toc
+
     # Write contamination READMEs for any contaminated backup
     foreach ($bName in $toc.Backups.Keys) {
         $b = $toc.Backups[$bName]
@@ -77,6 +80,29 @@ function _RunAnalyze {
             Write-ContaminationReadme -BackupPath $b.Path -Anomalies $b.Anomalies -TOC $toc
         }
     }
+
+    # Show any existing golden archives found in the backup root
+    $goldens = @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -match '^_golden_' } |
+                 Where-Object { Test-Path (Join-Path $_.FullName 'manifest.json') } |
+                 Sort-Object Name)
+    if ($goldens.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  Golden archives in this backup root:' -ForegroundColor Cyan
+        foreach ($gDir in $goldens) {
+            $mPath = Join-Path $gDir.FullName 'manifest.json'
+            try {
+                $m       = Get-Content $mPath -Raw | ConvertFrom-Json
+                $seq     = $m.goldenSequence
+                $created = $m.created
+                $devList = ($m.devices.PSObject.Properties.Name) -join ', '
+                Write-Host "    $($gDir.Name)  [seq=$seq  created=$created  devices: $devList]"
+            } catch {
+                Write-Host "    $($gDir.Name)  [manifest unreadable]" -ForegroundColor Yellow
+            }
+        }
+    }
+
     return $toc
 }
 
@@ -213,7 +239,7 @@ if ($Action) {
         'Golden' {
             $root  = _ResolveBackupRoot $BackupRoot
             $toc   = _RunAnalyze -Root $root
-            Detect-SplitSD -TOC $toc
+            Find-SplitSD -TOC $toc
             $gRoot = if ($GoldenRoot) { $GoldenRoot } else { $root }
             $exist = _FindLatestGolden -Root $gRoot
             if ($exist) {
@@ -252,14 +278,15 @@ if ($Action) {
 
 # ── First-time setup: desktop shortcut ───────────────────────────────────────
 function _CheckDesktopShortcut {
-    $settingsFile = Join-Path $PSScriptRoot 'settings.json'
+    $settingsFile = if ($env:VBM_SETTINGS_OVERRIDE) { $env:VBM_SETTINGS_OVERRIDE } else { Join-Path $PSScriptRoot 'settings.json' }
     $settings = if (Test-Path $settingsFile) {
         Get-Content $settingsFile -Raw | ConvertFrom-Json
     } else { [pscustomobject]@{} }
 
     if ($settings.PSObject.Properties['skipShortcutPrompt'] -and $settings.skipShortcutPrompt) { return }
 
-    $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Ventilator Backup Manager.lnk'
+    $desktopDir = if ($env:VBM_DESKTOP_OVERRIDE) { $env:VBM_DESKTOP_OVERRIDE } else { [Environment]::GetFolderPath('Desktop') }
+    $lnk = Join-Path $desktopDir 'Ventilator Backup Manager.lnk'
     if (Test-Path $lnk) { return }
 
     Write-Host ''
@@ -294,11 +321,28 @@ function _CheckDesktopShortcut {
 
 _CheckDesktopShortcut
 
-$backupRootDefault = _ResolveBackupRoot $BackupRoot
+# ── Load persisted settings (written by _CheckDesktopShortcut and case 7) ────
+$_wizSettingsFile = Join-Path $PSScriptRoot 'settings.json'
+$_wizSettings = if (Test-Path $_wizSettingsFile) {
+    Get-Content $_wizSettingsFile -Raw | ConvertFrom-Json
+} else { [pscustomobject]@{} }
+
+# CLI -BackupRoot takes priority, then saved setting, then workspace root
+$backupRootDefault = if ($BackupRoot) {
+    $BackupRoot
+} elseif ($_wizSettings.PSObject.Properties['backupRoot'] -and $_wizSettings.backupRoot) {
+    $_wizSettings.backupRoot
+} else {
+    Split-Path $PSScriptRoot -Parent
+}
+# Remember where goldens were last built — persists across backup-root changes
+$_wizGoldenRoot = if ($_wizSettings.PSObject.Properties['goldenRoot'] -and $_wizSettings.goldenRoot) {
+    $_wizSettings.goldenRoot
+} else { $null }
 Write-Host "Using backup root: $backupRootDefault" -ForegroundColor DarkGray
 
 while ($true) {
-    $choice = Show-MainMenu
+    $choice = Show-MainMenu -BackupRoot $backupRootDefault
     if ($choice -eq 0) { Write-Host 'Goodbye.'; break }
 
     try {
@@ -310,12 +354,16 @@ while ($true) {
             2 {
                 # Prepare (Golden + Export)
                 _RunPrepare -Root $backupRootDefault -GoldenRootIn $null -TargetIn $null -DevicesIn $null
+                # Persist the golden root so Validate can find it even if backup root changes later
+                $_wizGoldenRoot = $backupRootDefault
+                $_wizSettings | Add-Member -NotePropertyName goldenRoot -NotePropertyValue $_wizGoldenRoot -Force
+                $_wizSettings | ConvertTo-Json | Set-Content $_wizSettingsFile -Encoding UTF8
             }
             3 {
                 # Golden Archive only
                 $toc   = _RunAnalyze -Root $backupRootDefault
                 if (-not $toc) { continue }
-                Detect-SplitSD -TOC $toc
+                Find-SplitSD -TOC $toc
                 $gRoot = $backupRootDefault
                 $exist = _FindLatestGolden -Root $gRoot
 
@@ -342,10 +390,17 @@ while ($true) {
                     New-GoldenArchive -TOC $toc -GoldenRoot $gRoot -Devices $snList `
                         -ForceDevices $wForceDevices -ForceReason $wForceReason
                 }
+                # Persist the golden root so Validate can find it even if backup root changes later
+                $_wizGoldenRoot = $gRoot
+                $_wizSettings | Add-Member -NotePropertyName goldenRoot -NotePropertyValue $_wizGoldenRoot -Force
+                $_wizSettings | ConvertTo-Json | Set-Content $_wizSettingsFile -Encoding UTF8
             }
             4 {
                 # Back Up SD Card
-                $sdPath = Read-ValidatedPath -Prompt 'SD card path (e.g. E:\)' -MustExist
+                Write-Host ''
+                Write-Host '  You can select a physical drive or enter any folder that' -ForegroundColor DarkGray
+                Write-Host '  already contains Trilogy/ and/or P-Series/ subdirectories.' -ForegroundColor DarkGray
+                $sdPath = Show-SourcePicker
                 Import-SDCard -Source $sdPath -BackupRoot $backupRootDefault
                 Write-Host ''
                 if (Read-YesNo -Prompt 'Run Analyze to see updated table of contents?' -Default $true) {
@@ -364,19 +419,171 @@ while ($true) {
                 $safetyPath = Read-ValidatedPath -Prompt 'Safety backup destination path'
                 Invoke-Compaction -BackupRoot $backupRootDefault -SafetyPath $safetyPath
             }
+            7 {
+                # Settings — change backup root
+                Write-Host ''
+                Write-Host "  Current backup root: $backupRootDefault" -ForegroundColor Cyan
+                Write-Host '  Enter a new path, or leave blank to cancel.' -ForegroundColor DarkGray
+                Write-Host ''
+                $raw = (Read-Host '  New backup root').Trim().Trim('"', "'")
+                if ($raw) {
+                    $raw = $raw -replace '^~', $HOME
+                    if (-not (Test-Path $raw)) {
+                        Write-Host "  Path not found: $raw" -ForegroundColor Yellow
+                    } else {
+                        $backupRootDefault = $raw
+                        Write-Host "  Backup root changed to: $backupRootDefault" -ForegroundColor Green
+                        if (Read-YesNo -Prompt '  Save as default for future sessions?' -Default $true) {
+                            $_wizSettings | Add-Member -NotePropertyName backupRoot -NotePropertyValue $backupRootDefault -Force
+                            $_wizSettings | ConvertTo-Json | Set-Content $_wizSettingsFile -Encoding UTF8
+                            Write-Host '  Saved.' -ForegroundColor Green
+                        }
+                    }
+                }
+            }
             6 {
-                # Contamination README for a specific backup
+                # Validate selected backup folder(s) and/or golden archive(s)
                 $toc = _RunAnalyze -Root $backupRootDefault
                 if (-not $toc) { continue }
-                $contaminated = @($toc.Backups.Keys | Where-Object { $toc.Backups[$_].Integrity -eq 'Contaminated' })
-                if ($contaminated.Count -eq 0) {
-                    Write-Host 'No contaminated backups found.' -ForegroundColor Green
+
+                # Build unified entry list: backup folders + golden archives
+                # Each entry: @{ Label; Kind ('backup'|'golden'); Key (backup name or golden path) }
+                $entries = [System.Collections.Generic.List[hashtable]]::new()
+
+                foreach ($bName in ($toc.Backups.Keys | Sort-Object)) {
+                    $status = $toc.Backups[$bName].Integrity
+                    $entries.Add(@{ Label = "$bName  ($status)"; Kind = 'backup'; Key = $bName })
+                }
+
+                # Scan backup root AND the saved golden root (they differ when the backup root
+                # was changed after a golden was built, or when using the test-data path).
+                $goldenSearchPaths = [System.Collections.Generic.List[string]]::new()
+                $goldenSearchPaths.Add($backupRootDefault)
+                if ($_wizGoldenRoot -and $_wizGoldenRoot -ne $backupRootDefault -and (Test-Path $_wizGoldenRoot)) {
+                    $goldenSearchPaths.Add($_wizGoldenRoot)
+                }
+                $goldenItems = [System.Collections.Generic.List[object]]::new()
+                foreach ($gsp in $goldenSearchPaths) {
+                    $found = @(Get-ChildItem -LiteralPath $gsp -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^_golden_' } |
+                        Where-Object { Test-Path (Join-Path $_.FullName 'manifest.json') })
+                    foreach ($item in $found) { $goldenItems.Add($item) }
+                }
+                $goldens = @($goldenItems | Group-Object FullName | ForEach-Object { $_.Group[0] } | Sort-Object Name)
+                foreach ($g in $goldens) {
+                    $entries.Add(@{ Label = "$($g.Name)  [golden]"; Kind = 'golden'; Key = $g.FullName })
+                }
+
+                if ($entries.Count -eq 0) {
+                    Write-Host '  No backup or golden archive folders found.' -ForegroundColor Yellow; continue
+                }
+
+                Write-Host ''
+                Write-Host '  Select folder(s) to validate:' -ForegroundColor Cyan
+                Write-Host ''
+                for ($i = 0; $i -lt $entries.Count; $i++) {
+                    $e      = $entries[$i]
+                    $colour = if ($e.Kind -eq 'golden') { 'Cyan' `
+                              } elseif ($e.Label -match 'Contaminated') { 'Yellow' `
+                              } else { 'Gray' }
+                    Write-Host ("  [{0,2}] {1}" -f ($i + 1), $e.Label) -ForegroundColor $colour
+                }
+                Write-Host ''
+                Write-Host '  [A] All listed above' -ForegroundColor Cyan
+                Write-Host ''
+                $raw = (Read-Host '  Enter number(s) separated by commas, or A for all').Trim().ToUpperInvariant()
+                if (-not $raw) { continue }
+
+                $selectedEntries = if ($raw -eq 'A') {
+                    $entries.ToArray()
                 } else {
-                    Write-Host "Contaminated backups: $($contaminated -join ', ')" -ForegroundColor Yellow
-                    foreach ($bName in $contaminated) {
-                        $b = $toc.Backups[$bName]
-                        Write-ContaminationReadme -BackupPath $b.Path -Anomalies $b.Anomalies -TOC $toc
+                    $indices = $raw -split '[,\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' }
+                    @($indices | ForEach-Object {
+                        $idx = [int]$_ - 1
+                        if ($idx -ge 0 -and $idx -lt $entries.Count) { $entries[$idx] }
+                    })
+                }
+
+                if (@($selectedEntries).Count -eq 0) {
+                    Write-Host '  No valid selection.' -ForegroundColor Yellow; continue
+                }
+
+                Write-Host ''
+                foreach ($e in $selectedEntries) {
+                    if ($e.Kind -eq 'golden') {
+                        # Golden archive: integrity hash check + deep content validation
+                        $gPath = $e.Key
+                        Write-Host "  $($e.Label)" -ForegroundColor Cyan
+
+                        $integ = Test-GoldenIntegrity -GoldenPath $gPath
+                        if ($integ.Passed) {
+                            Write-Host "    Integrity check: PASSED ($($integ.FileCount) files verified)" -ForegroundColor Green
+                        } else {
+                            Write-Host "    Integrity check: FAILED — $($integ.Failures.Count) issue(s)" -ForegroundColor Red
+                            foreach ($f in $integ.Failures | Select-Object -First 5) {
+                                Write-Host "      • $f" -ForegroundColor Red
+                            }
+                        }
+
+                        $content = Test-GoldenContent -GoldenPath $gPath
+                        if ($content.Passed) {
+                            Write-Host "    Content validation: PASSED ($($content.FileCount) files, $($content.WarningCount) warning(s))" -ForegroundColor Green
+                        } else {
+                            $nErr = $content.CriticalCount + $content.ErrorCount
+                            Write-Host "    Content validation: $nErr issue(s) — $($content.CriticalCount) Critical, $($content.ErrorCount) Error, $($content.WarningCount) Warning" -ForegroundColor Red
+                        }
+                        # Always show warnings and errors so none are silently swallowed
+                        $allIssues = @($content.Issues)
+                        if ($allIssues.Count -gt 0) {
+                            foreach ($issue in $allIssues | Select-Object -First 15) {
+                                $ic = switch ($issue.Severity) { 'Critical' { 'Red' } 'Error' { 'Yellow' } default { 'DarkYellow' } }
+                                Write-Host "      [$($issue.Severity.ToUpper())] $($issue.Category) $($issue.Device) $($issue.File): $($issue.Message)" -ForegroundColor $ic
+                            }
+                            if ($allIssues.Count -gt 15) {
+                                Write-Host "      ... and $($allIssues.Count - 15) more issue(s)." -ForegroundColor DarkGray
+                            }
+                        }
+                    } else {
+                        # Regular backup folder: contamination / anomaly check
+                        $b      = $toc.Backups[$e.Key]
+                        $result = Test-BackupIntegrity -BackupDetail $b -TOC $toc
+                        $colour = if ($result.Integrity -eq 'Clean') { 'Green' } else { 'Yellow' }
+                        Write-Host ("  {0,-30} — {1}" -f $e.Key, $result.Integrity) -ForegroundColor $colour
+
+                        $anomalies = @($result.Anomalies)
+                        if ($anomalies.Count -eq 0) {
+                            Write-Host '    No anomalies found.' -ForegroundColor DarkGray
+                        } else {
+                            # Group by (Type, Detail) so duplicate messages are collapsed with a file count
+                            $groups = @($anomalies | Group-Object { "$($_.Type)|$($_.Detail)" } |
+                                        Sort-Object {
+                                            $sev = switch ($_.Group[0].Severity) { 'High' { 0 } 'Medium' { 1 } default { 2 } }
+                                            $typ = switch ($_.Group[0].Type) {
+                                                'Contamination'      { 0 }
+                                                'TruncatedFile'      { 1 }
+                                                'PSeriesConsistency' { 2 }
+                                                'SizeRegression'     { 3 }
+                                                'MissingPair'        { 4 }
+                                                default              { 5 }
+                                            }
+                                            $sev * 10 + $typ
+                                        })
+                            $shownFiles = 0
+                            foreach ($grp in $groups | Select-Object -First 10) {
+                                $a         = $grp.Group[0]
+                                $ac        = switch ($a.Severity) { 'High' { 'Red' } 'Medium' { 'Yellow' } default { 'DarkGray' } }
+                                $countNote = if ($grp.Count -gt 1) { " [$($grp.Count) files]" } else { '' }
+                                Write-Host "    [$($a.Type)] $($a.Detail)$countNote" -ForegroundColor $ac
+                                $shownFiles += $grp.Count
+                            }
+                            $remaining = $anomalies.Count - $shownFiles
+                            if ($remaining -gt 0) {
+                                $word = if ($remaining -eq 1) { 'anomaly' } else { 'anomalies' }
+                                Write-Host "    ... and $remaining more $word." -ForegroundColor DarkGray
+                            }
+                        }
                     }
+                    Write-Host ''
                 }
             }
         }

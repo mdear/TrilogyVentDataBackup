@@ -32,7 +32,7 @@ function Export-ToTarget {
 
     # Resolve device list
     $allSNs = @($manifest.devices.PSObject.Properties | ForEach-Object { $_.Name })
-    $snList = if ($Devices -and $Devices.Count -gt 0) { $Devices } else { $allSNs }
+    $snList = @(if ($Devices -and $Devices.Count -gt 0) { $Devices } else { $allSNs })
 
     # Validate requested SNs exist in manifest
     foreach ($sn in $snList) {

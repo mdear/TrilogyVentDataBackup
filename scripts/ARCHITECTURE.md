@@ -23,7 +23,7 @@
   - [3. Golden Archive](#3-golden-archive)
   - [4. Back Up an SD Card (Ingest)](#4-back-up-an-sd-card-ingest)
   - [5. Compact (Deduplicate)](#5-compact-deduplicate)
-  - [6. Contamination README](#6-contamination-readme)
+  - [6. Validate Backup(s)](#6-validate-backups)
 - [Data Corruption Handling](#data-corruption-handling)
   - [Correctable](#correctable-using-data-from-other-backups)
   - [Flaggable Only](#flaggable-only-no-automated-fix-possible)
@@ -272,6 +272,20 @@ sizes) and must confirm before overwriting.
 ### 3. Golden Archive
 
 The golden archive is the verified "source of truth" built from all clean backups.
+A golden must be **internally self-consistent**: every Trilogy file type that depends
+on pairing (AD/DD) or on a month having a complete pair (WD, EL_, PP JSON ring data)
+must have its counterpart present. Building a golden may require *rewinding* the
+collected file set to the latest self-consistent state — dropping or replacing files
+that would violate consistency, and logging every such action in the per-device
+`rewindLog` field in `manifest.json`.
+
+**Contaminated backup salvage**: Devices whose data exists exclusively in a
+contaminated backup are not silently omitted. The golden builder performs a second
+gather pass over contaminated backups and rescues:
+- Trilogy EDF files whose embedded header SN unambiguously identifies the target device
+- P-Series files via their `P-Series/{SN}/` path (equally unambiguous)
+Salvage events appear in the `rewindLog`. The salvaged files are then subject to the
+same rewind consistency rules as data from clean backups.
 
 **First golden**: Collects all clean, verified data across all devices from all backups.
 When the same filename exists in multiple backups, the largest version wins (most
@@ -360,6 +374,12 @@ contributing backups and a `splitSD` flag is set to `true`.
     "splitSDSpans": [
       { "earliest": "2023-03", "latest": "2024-07", "sourceFolders": ["4.10.2024"] },
       { "earliest": "2024-09", "latest": "2025-12", "sourceFolders": ["12.1.2025"] }
+    ],
+    "rewindLog": [
+      { "Action": "SalvagedFromContaminated", "File": "Trilogy/AD_202408_099.edf",
+        "Reason": "EDF header SN confirmed as TVXX0000001 in contaminated backup '12.1.2025.002'" },
+      { "Action": "DroppedOrphan", "File": "Trilogy/AD_202407_000.edf",
+        "Reason": "AD_202407_000.edf has no matching DD_202407_000.edf (partial SD flush)" }
     ]
   }
 }
@@ -374,7 +394,11 @@ a two-stage validation pass before being presented to the user as complete.
 Verifies every file listed in `manifest.json` is present on disk with a matching MD5
 hash, and that each EDF file's embedded serial number matches the device folder it
 lives in. This is a fast, manifest-driven pass that confirms no files were lost or
-corrupted during the copy operations that built the golden.
+corrupted during the copy operations that built the golden. AD/DD pair completeness
+is intentionally **not** checked here — it is handled by `Test-GoldenContent`, which
+reports AD/DD pairing problems as **Errors** (see `EdfPairing` category below).
+Because the rewind step ensures every correctly-built golden is already self-consistent,
+an EdfPairing finding is an archive-integrity problem, not merely a source-data gap.
 
 **Stage 2 — `Test-GoldenContent` (deep format validation)**  
 A thorough per-file format inspection that runs across every file in the golden — not
@@ -398,7 +422,7 @@ Issues are further categorised to aid diagnosis:
 |----------|--------|
 | `DirectViewCompat` | Missing `Trilogy/` or `P-Series/` directories, missing `last.txt`, missing `prop.txt`, no AD_*.edf files |
 | `EdfFormat` | EDF header field violations: version, header byte count, StartDate/StartTime format, NumDataRecords validity, NumSignals range, SN mismatch; also BIN filename pattern failures and EL_ CSV binary SN check |
-| `EdfPairing` | AD_YYYYMM_NNN.edf without a matching DD_YYYYMM_NNN.edf (or vice versa) |
+| `EdfPairing` | AD_YYYYMM_NNN.edf without a matching DD_YYYYMM_NNN.edf (or vice versa). Severity is **Error** because the rewind step ensures every correctly-built golden is self-consistent; an EdfPairing finding means the rewind was bypassed or failed, which is an archive-integrity problem. |
 | `PSeriesFormat` | prop.txt field validation (SN, MN, PT, SV presence and format), FILES.SEQ/TRANSMITFILE.SEQ parse and superset check, SL_SAPPHIRE.json JSON validity, PP JSON required-field and SN checks |
 | `ManifestSchema` | manifest.json parse failure, missing required keys, invalid field values, device folder ↔ manifest entry mismatches |
 | `DirectoryStructure` | Device folders present on disk but absent from manifest, or vice versa |
@@ -409,7 +433,7 @@ Issues are further categorised to aid diagnosis:
 |-------|------|----------------------|
 | File size | ≥ 256 bytes | Critical |
 | Version | Exactly `"0"` | Error |
-| HeaderBytes | Exactly 256 | Error |
+| HeaderBytes | Positive multiple of 256 — (1 + num_signals) × 256, e.g. 256 (0 signals), 512 (1 signal), 2816 (10 signals) | Error |
 | StartDate | Matches `dd.mm.yy` | Warning |
 | StartTime | Matches `hh.mm.ss` | Warning |
 | NumDataRecords | `"-1"` or non-negative integer | Error |
@@ -467,11 +491,15 @@ separate copies (defeating storage savings) or corrupt files during sync. The to
 must warn the user if BackupRoot is inside a Dropbox-synced folder and recommend
 using a non-synced safety backup location.
 
-### 6. Contamination README
+### 6. Validate Backup(s)
 
-When contamination is detected in any backup folder, the tool generates a README.md
-inside that folder documenting which files are affected, what the correct device
-should be, where clean versions can be found, and the full provenance chain.
+Scans all backup folders in the root (running `Analyze` first) and discovers all
+`_golden_*` archive folders. Presents a unified numbered list so the user can
+select any combination to validate. Golden archives are validated with
+`Test-GoldenIntegrity` (SHA-256 manifest check) and `Test-GoldenContent`
+(per-file format + DirectView compatibility). Regular backup folders are validated
+with `Test-BackupIntegrity` (contamination, missing pairs, truncation, P-Series
+consistency). Results and anomalies are displayed inline.
 
 ## Data Corruption Handling
 

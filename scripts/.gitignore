@@ -1,2 +1,6 @@
 # ── Per-machine state (not shared) ──
 settings.json
+
+# ── Test run artefacts ──
+tests/last-run.log
+tests/last-run.txt
