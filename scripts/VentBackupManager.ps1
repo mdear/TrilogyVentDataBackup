@@ -322,7 +322,7 @@ function _CheckDesktopShortcut {
 _CheckDesktopShortcut
 
 # ── Load persisted settings (written by _CheckDesktopShortcut and case 7) ────
-$_wizSettingsFile = Join-Path $PSScriptRoot 'settings.json'
+$_wizSettingsFile = if ($env:VBM_SETTINGS_OVERRIDE) { $env:VBM_SETTINGS_OVERRIDE } else { Join-Path $PSScriptRoot 'settings.json' }
 $_wizSettings = if (Test-Path $_wizSettingsFile) {
     Get-Content $_wizSettingsFile -Raw | ConvertFrom-Json
 } else { [pscustomobject]@{} }
