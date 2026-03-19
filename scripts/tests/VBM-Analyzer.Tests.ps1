@@ -82,6 +82,29 @@ Describe 'Get-BackupInventory — folder discovery and exclusions' {
         $parentEntry.SubBackups[0].Name | Should -Be 'bak_with_sub/vent 2'
     }
 
+    It 'discovers a folder whose data is one level deep under any intermediate folder name (e.g. SD card/F_)' {
+        # No Trilogy or P-Series directly in the parent; data lives inside an
+        # arbitrarily-named sub-folder — the SD card reader layout pattern.
+        $parent = Join-Path $script:root 'bak_sdcard_layout'
+        $null = New-Item -ItemType Directory "$parent\F_\Trilogy"  -Force
+        $null = New-Item -ItemType Directory "$parent\F_\P-Series" -Force
+        $inv  = Get-BackupInventory -BackupRoot $script:root
+        $parentEntry = $inv | Where-Object Name -eq 'bak_sdcard_layout'
+        $parentEntry | Should -Not -BeNullOrEmpty
+        $parentEntry.HasTrilogy | Should -Be $false   # not direct
+        $parentEntry.HasPSeries | Should -Be $false   # not direct
+        $parentEntry.SubBackups | Should -HaveCount 1
+        $parentEntry.SubBackups[0].Name      | Should -Be 'bak_sdcard_layout/F_'
+        $parentEntry.SubBackups[0].HasTrilogy | Should -Be $true
+        $parentEntry.SubBackups[0].HasPSeries | Should -Be $true
+    }
+
+    It 'still excludes a folder with neither direct nor indirect Trilogy/P-Series' {
+        $null = New-Item -ItemType Directory (Join-Path $script:root 'no_vent_data_deep\SomeOtherDir\UnrelatedFolder') -Force
+        $inv  = Get-BackupInventory -BackupRoot $script:root
+        ($inv | Where-Object Name -eq 'no_vent_data_deep') | Should -BeNullOrEmpty
+    }
+
     It 'emits a warning when BackupRoot is inside a Dropbox folder' {
         # Simulate a Dropbox root by creating a temp dir with a .dropbox marker file
         $dbRoot = New-TempDir

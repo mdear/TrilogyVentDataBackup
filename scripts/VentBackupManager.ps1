@@ -221,7 +221,40 @@ function _RunPrepare {
 
     Export-ToTarget -GoldenPath $goldenOut -Target $tgtPath -Devices $selectedSNs
 }
+# ── Helper: run Gap Analysis ────────────────────────────────────────────────────────
+function _RunGapAnalysis {
+    param([string]$Root)
 
+    $Root = _ResolveBackupRoot $Root
+    $toc  = _RunAnalyze -Root $Root
+    if (-not $toc) { return }
+
+    if ($toc.Devices.Count -eq 0) {
+        Write-Host '  No devices found.' -ForegroundColor Yellow
+        return
+    }
+
+    # Let user pick which devices to analyse (all pre-selected by default)
+    $selectedSNs = Show-DeviceSelection -Devices $toc.Devices -Suggested @($toc.Devices.Keys | Sort-Object)
+    if (@($selectedSNs).Count -eq 0) { Write-Host 'No devices selected. Aborting.'; return }
+
+    # Debounce threshold
+    Write-Host ''
+    Write-Host '  Gaps of N weeks or fewer are shown dimmed as possible noise.' -ForegroundColor DarkGray
+    Write-Host '  Enter 0 to surface every gap including single-month ones.' -ForegroundColor DarkGray
+    Write-Host ''
+    $rawDebounce    = (Read-Host '  Debounce threshold — suppress gaps ≤ N weeks [default: 4]').Trim()
+    $debounceWeeks  = 4
+    if ($rawDebounce -match '^\d+$') { $debounceWeeks = [int]$rawDebounce }
+
+    # Compute gaps for each selected device
+    $results = [System.Collections.Generic.List[object]]::new()
+    foreach ($sn in $selectedSNs) {
+        $results.Add((Get-DeviceGaps -TOC $toc -DeviceSerial $sn -DebounceWeeks $debounceWeeks))
+    }
+
+    Show-GapSwimLanes -GapResults $results.ToArray() -DebounceWeeks $debounceWeeks
+}
 # ── CLI dispatch ──────────────────────────────────────────────────────────────
 
 if ($Action) {
@@ -585,6 +618,10 @@ while ($true) {
                     }
                     Write-Host ''
                 }
+            }
+            8 {
+                # Gap Analysis
+                _RunGapAnalysis -Root $backupRootDefault
             }
         }
     } catch {

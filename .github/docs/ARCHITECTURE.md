@@ -24,6 +24,7 @@
   - [4. Back Up an SD Card (Ingest)](#4-back-up-an-sd-card-ingest)
   - [5. Compact (Deduplicate)](#5-compact-deduplicate)
   - [6. Validate Backup(s)](#6-validate-backups)
+  - [7. Gap Analysis](#7-gap-analysis)
 - [Data Corruption Handling](#data-corruption-handling)
   - [Correctable](#correctable-using-data-from-other-backups)
   - [Flaggable Only](#flaggable-only-no-automated-fix-possible)
@@ -500,6 +501,42 @@ select any combination to validate. Golden archives are validated with
 (per-file format + DirectView compatibility). Regular backup folders are validated
 with `Test-BackupIntegrity` (contamination, missing pairs, truncation, P-Series
 consistency). Results and anomalies are displayed inline.
+
+### 7. Gap Analysis
+
+Renders per-device chronological swim lanes across all backups, highlighting date
+ranges where AD/DD telemetry data is absent. Useful for identifying periods of
+missing therapy records before a clinician visit or archive hand-off.
+
+The user selects one or more devices (all pre-selected by default) and sets a
+debounce threshold (in weeks). Gaps shorter than or equal to the threshold are
+rendered as noise and dimmed; gaps exceeding it are rendered prominently as real
+missing data.
+
+**Output**: one console row per device, scaled to the terminal width. Bar symbols:
+
+| Symbol | Color | Meaning |
+|--------|-------|---------|
+| `█` | Green | Clean AD/DD data present |
+| `▓` | Magenta | Month covered only by contaminated backup(s) |
+| `░` | Red | Real gap — no AD/DD data in any backup |
+| `▒` | Dark yellow | Noise gap — duration ≤ debounce threshold |
+
+Below each bar, real gaps are listed with their exact `YYYY-MM → YYYY-MM` span and
+approximate duration (months and weeks). Debounced gaps are summarised as a count.
+
+**Debounce threshold**: Measured in weeks (4 weeks ≈ 1 month). Default is 4 weeks,
+which suppresses single-month gaps that often arise from backup timing rather than a
+genuine records gap. Set to 0 to surface every gap regardless of size.
+
+**Implementation**: `Get-DeviceGaps` (VBM-Analyzer.psm1) computes covered months and
+gap runs for one device across all backups; `Show-GapSwimLanes` (VBM-UI.psm1)
+renders the swim lane display. Both are invoked by the `_RunGapAnalysis` helper in
+`VentBackupManager.ps1`.
+
+The year-label axis header is built into a `StringBuilder` allocated 3 characters
+wider than the bar itself, so a year label whose tick position falls at or near the
+right edge is never clipped (the extra space is trimmed before display).
 
 ## Data Corruption Handling
 

@@ -16,6 +16,7 @@
   - [Get-BackupTOC](#get-backuptoc--inventory-array---progresscallback-scriptblock)
   - [Test-BackupIntegrity](#test-backupintegrity--backupdetail-obj)
   - [Get-DeviceTimeline](#get-devicetimeline--toc-obj--deviceserial-string)
+  - [Get-DeviceGaps](#get-devicegaps--toc-obj--deviceserial-string--debounceweeks-int)
   - [Write-ContaminationReadme](#write-contaminationreadme--backuppath-path--anomalies-array--toc-obj)
   - [Show-TOC](#show-toc--toc-obj)
 - [VBM-GoldenArchive.psm1](#vbm-goldenarchivepsm1)
@@ -35,6 +36,7 @@
 - [VBM-UI.psm1](#vbm-uipsm1)
   - [Wizard Functions](#wizard-functions)
   - [Show-DeviceSelection Behavior](#show-deviceselection-behavior)
+  - [Show-GapSwimLanes](#show-gapswimlanesthis-gapresults-array--debounceweeks-int--maxwidth-int)
 - [VentBackupManager.ps1 (Entry Point)](#ventbackupmanagerps1-entry-point)
 - [Data Flow Summary](#data-flow-summary)
 
@@ -223,8 +225,15 @@ Stateless functions that parse every file format on the SD card.
 Scans backup directories and builds the data model used by all other modules.
 
 ### `Get-BackupInventory -BackupRoot <path>`
-Discovers backup folders. A valid backup folder has a `Trilogy/` or `P-Series/`
-subdirectory. Also discovers nested backup locations (e.g. `4.10.2024/vent 2/`).
+Discovers backup folders. A valid backup folder must meet at least one of:
+- Has a `Trilogy/` or `P-Series/` subdirectory directly, **or**
+- Contains a single intermediate subfolder (any name) that itself has a `Trilogy/`
+  or `P-Series/` subdirectory — the SD card reader layout where the card's root
+  partition appears as an intermediate folder (e.g. `SD card 26-03-18/F_/Trilogy/`).
+
+In the second case the top-level folder is still returned as the backup entry; the
+intermediate folder is registered as a sub-backup (e.g. `SD card 26-03-18/F_`).
+This is the same mechanism used for explicitly nested backups (`4.10.2024/vent 2/`).
 
 **Exclusion patterns** (folders inside BackupRoot that are NOT backups):
 - `scripts/` — the toolchain itself
@@ -304,6 +313,47 @@ Returns array of anomaly objects: `@{ Type, Severity, File, Detail, Suggestion }
 
 ### `Get-DeviceTimeline -TOC <obj> -DeviceSerial <string>`
 Builds a per-device chronological view across all backups.
+
+### `Get-DeviceGaps -TOC <obj> -DeviceSerial <string> [-DebounceWeeks <int>]`
+Computes covered months and chronological gap runs for one device across all backups.
+
+**Parameters**:
+- `-TOC` — full TOC from `Get-BackupTOC`
+- `-DeviceSerial` — device SN to analyse
+- `-DebounceWeeks` — gaps with approximate duration ≤ this value (in weeks, 4 per
+  month) are flagged `IsDebounced`. Default: 4. Set to 0 to surface every gap.
+
+**Month inclusion**: Only monthly AD or DD files (`IsDaily = $false`) are counted.
+WD daily files and P-Series are not considered for coverage.
+
+For contamination handling, months covered only by contaminated backups are tracked
+separately in `ContaminatedMonths`; clean coverage supersedes contaminated for the
+same month.
+
+**Returns** `PSCustomObject`:
+```
+@{
+    DeviceSerial       = 'TVXX0000001'
+    OverallEarliest    = '2023-03'    # or $null if no data
+    OverallLatest      = '2025-12'
+    CoveredMonths      = @('2023-03', '2023-04', ...)  # sorted YYYY-MM strings
+    Gaps               = @(
+        @{
+            Start          = '2024-05'
+            End            = '2024-07'
+            DurationMonths = 3
+            DurationWeeks  = 12        # DurationMonths * 4
+            IsDebounced    = $false    # DurationWeeks > DebounceWeeks
+            Months         = @('2024-05', '2024-06', '2024-07')
+        }
+    )
+    ContaminatedMonths = @('2024-08')  # months with data only from contaminated backups
+}
+```
+
+**Implementation note**: Month keys (`YYYY-MM`) are built with `.PadLeft(2,'0')` on the
+month number rather than format specifiers, to avoid `FormatException` if PowerShell's
+type system has boxed integer fields as non-integer numeric types.
 
 ### `Write-ContaminationReadme -BackupPath <path> -Anomalies <array> -TOC <obj>`
 Generates `README.md` in the backup folder listing contaminated files, expected vs
@@ -567,7 +617,7 @@ write operation across the entire toolset.
 ## VBM-UI.psm1
 
 ### Wizard Functions
-- `Show-MainMenu` → returns choice (1-5)
+- `Show-MainMenu` → returns choice (1-8), or 0 for Quit
 - `Read-ValidatedPath -Prompt <string> [-MustExist]` → validated path string
 - `Read-YesNo -Prompt <string> [-Default <bool>]` → boolean
 - `Show-DeviceSelection -Devices <hashtable> -Suggested <string[]>` → selected SN array
@@ -577,6 +627,7 @@ write operation across the entire toolset.
   **Note**: `Show-TOC` (in VBM-Analyzer) contains its own inline timeline renderer
   appropriate for the full TOC summary view. `Write-TimelineChart` is a general-purpose
   chart for single-device or caller-assembled timelines and is not called by `Show-TOC`.
+- `Show-GapSwimLanes -GapResults <PSCustomObject[]> [-DebounceWeeks <int>] [-MaxWidth <int>]` → swim lane display
 
 ### `Show-DeviceSelection` Behavior
 Presents the device list with a pre-selected suggestion:
@@ -600,6 +651,42 @@ only when building or updating a golden archive.
    d. Returns `@{ ForceDevices=$true; SelectedSNs=@(...); Reason="..." }`.
 4. The caller passes `SelectedSNs` as `-ForceDevices` and `Reason` as `-ForceReason`
    to `New-GoldenArchive` / `Update-GoldenArchive`.
+
+### `Show-GapSwimLanes -GapResults <PSCustomObject[]> [-DebounceWeeks <int>] [-MaxWidth <int>]`
+Renders per-device chronological swim lanes to the console. Called by `_RunGapAnalysis`
+in `VentBackupManager.ps1` after `Get-DeviceGaps` has been called for each selected device.
+
+**Parameters**:
+- `-GapResults` — array of `PSCustomObject` results from `Get-DeviceGaps` (one per device)
+- `-DebounceWeeks` — threshold displayed in the header and legend. Default: 4
+- `-MaxWidth` — maximum bar width in characters. Default: 72 (fits 80-col terminals)
+
+**Layout**: One row per device. Bar width is `min(MaxWidth, totalMonths)`. When the
+timeline spans more months than bar characters, each character represents multiple
+months (scaled). A year-label axis appears above the bars.
+
+**Scaling and position mapping**: A scriptblock (`$gapPos`) maps each `YYYY-MM` key
+to a bar position using integer division against a pre-computed `$scaleDouble`. Using
+a scriptblock (instead of a nested `function`) is a deliberate design choice:
+PowerShell module functions create child scopes of the **module** scope, not the
+caller's scope, so a nested function cannot access local variables from its enclosing
+function. Scriptblocks are true closures that capture their defining scope.
+
+**Bar characters**:
+
+| Char | Color | Meaning |
+|------|-------|---------|
+| `█` | Green | Clean AD/DD data present |
+| `▓` | Magenta | Contaminated-only coverage |
+| `░` | Red | Real gap (> debounce threshold) |
+| `▒` | Dark yellow | Noise gap (≤ debounce threshold) |
+| ` ` | — | No data / outside covered range |
+
+**Detail lines** below each bar:
+- Real gaps: `↳ GAP  YYYY-MM → YYYY-MM  [N months / ~N weeks]`
+- Debounced gaps: `↳ N noise gap(s) ≤K week(s) — not shown`
+- Contaminated months: `↳ N month(s) covered only by contaminated backup(s)`
+- No issues: `↳ Complete — no gaps detected`
 
 ## VentBackupManager.ps1 (Entry Point)
 
@@ -690,6 +777,10 @@ Compact:    BackupRoot → warn → Read-ValidatedPath (safety location)
 
 Validate:   BackupRoot → Get-BackupInventory → Get-BackupTOC → [user selects backup(s)]
                        → Test-BackupIntegrity (per selected backup) → display anomalies
+
+GapAnalysis: BackupRoot → Get-BackupTOC → Show-DeviceSelection
+                        → [per device] Get-DeviceGaps(-DebounceWeeks)
+                        → Show-GapSwimLanes(-GapResults, -DebounceWeeks)
 ```
 
 ## Known Edge Cases & Regression Guards

@@ -201,9 +201,10 @@ function Get-BackupInventory {
 
         $hasT = Test-Path (Join-Path $item.FullName 'Trilogy')
         $hasP = Test-Path (Join-Path $item.FullName 'P-Series')
-        if (-not $hasT -and -not $hasP)   { continue }
 
-        # Discover nested sub-backups (e.g. "4.10.2024/vent 2")
+        # Discover nested sub-backups (e.g. "4.10.2024/vent 2" or "SD card 26-03-18/F_").
+        # Scanned before the skip guard so that folders with no direct Trilogy/P-Series
+        # but with data one level deeper (any intermediate folder name) are still accepted.
         $subList = [System.Collections.Generic.List[object]]::new()
         foreach ($sub in Get-ChildItem -LiteralPath $item.FullName -Directory -ErrorAction SilentlyContinue) {
             $sName = $sub.Name
@@ -220,6 +221,9 @@ function Get-BackupInventory {
                 })
             }
         }
+
+        # Skip folders with no backup data at this level or one level down
+        if (-not $hasT -and -not $hasP -and $subList.Count -eq 0) { continue }
 
         $results.Add([PSCustomObject]@{
             Name       = $name
@@ -934,11 +938,155 @@ function Find-SplitSD {
 
 #endregion
 
+#region ── Get-DeviceGaps ────────────────────────────────────────────────────
+
+function Get-DeviceGaps {
+    <#
+    .SYNOPSIS
+        Compute the covered months and chronological gaps for one device across all backups.
+    .PARAMETER TOC
+        Full TOC from Get-BackupTOC.
+    .PARAMETER DeviceSerial
+        The device SN to analyse.
+    .PARAMETER DebounceWeeks
+        Gaps whose approximate duration in weeks is <= this value are flagged IsDebounced.
+        Each missing month is treated as 4 weeks for comparison purposes.
+        Default: 4 (debounce single-month gaps).
+        Set to 0 to surface every gap regardless of size.
+    .OUTPUTS
+        PSCustomObject:
+          DeviceSerial       string
+          OverallEarliest    'YYYY-MM' or $null
+          OverallLatest      'YYYY-MM' or $null
+          CoveredMonths      string[]   sorted list of 'YYYY-MM' months with AD/DD data
+          Gaps               PSCustomObject[]  {
+                               Start, End, DurationMonths, DurationWeeks,
+                               IsDebounced, Months }
+          ContaminatedMonths string[]   months covered only by contaminated backups
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][PSCustomObject]$TOC,
+        [Parameter(Mandatory)][string]$DeviceSerial,
+        [int]$DebounceWeeks = 4
+    )
+
+    # Internal helper: build a safe YYYY-MM key without using format specifiers that
+    # require the argument to be an integer type (avoids FormatException if the stored
+    # value has been boxed as a different numeric type by PowerShell's type system).
+    function _MonthKey([int]$yr, [int]$mo) {
+        [string]$yr + '-' + ([string]$mo).PadLeft(2,'0')
+    }
+
+    # Collect months with AD/DD coverage, separated into clean vs contaminated-only
+    $cleanMonths      = [System.Collections.Generic.HashSet[string]]::new()
+    $contamOnlyMonths = [System.Collections.Generic.HashSet[string]]::new()
+
+    foreach ($bName in $TOC.Backups.Keys) {
+        $b = $TOC.Backups[$bName]
+        if (-not $b.Devices.ContainsKey($DeviceSerial)) { continue }
+        $dev     = $b.Devices[$DeviceSerial]
+        $isClean = ($b.Integrity -ne 'Contaminated')
+        foreach ($f in $dev.TrilogyFiles) {
+            if ($f.FileType -notin @('AD', 'DD')) { continue }
+            if ($f.IsDaily)                        { continue }
+            if (-not $f.Year -or -not $f.Month)   { continue }
+            $key = _MonthKey ([int]$f.Year) ([int]$f.Month)
+            if ($isClean) {
+                [void]$cleanMonths.Add($key)
+                [void]$contamOnlyMonths.Remove($key)   # clean supersedes
+            } elseif (-not $cleanMonths.Contains($key)) {
+                [void]$contamOnlyMonths.Add($key)
+            }
+        }
+    }
+
+    $allCovered = [System.Collections.Generic.HashSet[string]]::new($cleanMonths)
+    foreach ($m in $contamOnlyMonths) { [void]$allCovered.Add($m) }
+
+    if ($allCovered.Count -eq 0) {
+        return [PSCustomObject]@{
+            DeviceSerial       = $DeviceSerial
+            OverallEarliest    = $null
+            OverallLatest      = $null
+            CoveredMonths      = @()
+            Gaps               = @()
+            ContaminatedMonths = @()
+        }
+    }
+
+    $sortedCovered = @($allCovered | Sort-Object)
+    $earliest = $sortedCovered[0]
+    $latest   = $sortedCovered[-1]
+
+    # Enumerate every month within [earliest, latest]
+    $sy = [int]$earliest.Substring(0,4); $sm = [int]$earliest.Substring(5,2)
+    $ey = [int]$latest.Substring(0,4);   $em = [int]$latest.Substring(5,2)
+    $allMonths = [System.Collections.Generic.List[string]]::new()
+    $cy = $sy; $cm = $sm
+    while (($cy * 12 + $cm) -le ($ey * 12 + $em)) {
+        $allMonths.Add((_MonthKey $cy $cm))
+        $cm++
+        if ($cm -gt 12) { $cm = 1; $cy++ }
+    }
+
+    # Find contiguous gap runs
+    $gaps     = [System.Collections.Generic.List[object]]::new()
+    $gapStart = $null
+    $gapBuf   = [System.Collections.Generic.List[string]]::new()
+    foreach ($month in $allMonths) {
+        if (-not $allCovered.Contains($month)) {
+            if (-not $gapStart) { $gapStart = $month }
+            $gapBuf.Add($month)
+        } else {
+            if ($gapStart) {
+                $dur      = $gapBuf.Count
+                $durWeeks = $dur * 4        # 4 weeks per month (approximate)
+                $gaps.Add([PSCustomObject]@{
+                    Start          = $gapStart
+                    End            = $gapBuf[$gapBuf.Count - 1]
+                    DurationMonths = $dur
+                    DurationWeeks  = $durWeeks
+                    IsDebounced    = ($durWeeks -le $DebounceWeeks)
+                    Months         = $gapBuf.ToArray()
+                })
+                $gapStart = $null
+                $gapBuf   = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+    }
+    # Flush any trailing gap at the end of the covered range
+    if ($gapStart) {
+        $dur      = $gapBuf.Count
+        $durWeeks = $dur * 4
+        $gaps.Add([PSCustomObject]@{
+            Start          = $gapStart
+            End            = $gapBuf[$gapBuf.Count - 1]
+            DurationMonths = $dur
+            DurationWeeks  = $durWeeks
+            IsDebounced    = ($durWeeks -le $DebounceWeeks)
+            Months         = $gapBuf.ToArray()
+        })
+    }
+
+    return [PSCustomObject]@{
+        DeviceSerial       = $DeviceSerial
+        OverallEarliest    = $earliest
+        OverallLatest      = $latest
+        CoveredMonths      = $sortedCovered
+        Gaps               = $gaps.ToArray()
+        ContaminatedMonths = @($contamOnlyMonths | Sort-Object)
+    }
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Get-BackupInventory',
     'Get-BackupTOC',
     'Test-BackupIntegrity',
     'Get-DeviceTimeline',
+    'Get-DeviceGaps',
     'Write-ContaminationReadme',
     'Show-TOC',
     'Find-SplitSD'

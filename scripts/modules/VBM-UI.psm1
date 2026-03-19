@@ -29,12 +29,13 @@ function Show-MainMenu {
     Write-Host '  5) Compact        — Deduplicate backups (NTFS hardlinks)'
     Write-Host '  6) Validate       — Check integrity of backup(s) and/or golden archive(s)'
     Write-Host '  7) Settings       — Change backup root directory'
+    Write-Host '  8) Gap Analysis   — Chronological swim lanes showing data gaps per device'
     Write-Host ''
     Write-Host '  Q) Quit'
     Write-Host ''
     do {
         $choice = (Read-Host 'Choose an option').Trim().ToUpperInvariant()
-    } while ($choice -notin @('1','2','3','4','5','6','7','Q'))
+    } while ($choice -notin @('1','2','3','4','5','6','7','8','Q'))
 
     if ($choice -eq 'Q') { return 0 }
     return [int]$choice
@@ -452,6 +453,184 @@ function Show-ForceDevicesPrompt {
 
 #endregion
 
+#region ── Show-GapSwimLanes ─────────────────────────────────────────────────
+
+function Show-GapSwimLanes {
+    <#
+    .SYNOPSIS
+        Render chronological swim lanes for one or more devices, highlighting data gaps.
+    .DESCRIPTION
+        Each device gets one row. Each character in the bar represents one or more
+        months (scaled when the timeline is long). Characters:
+          █  clean data present      (Green)
+          ▓  contaminated-only data  (Magenta)
+          ░  real gap                (Red)
+          ▒  noise / debounced gap   (DarkYellow)
+    .PARAMETER GapResults
+        Array of PSCustomObjects from Get-DeviceGaps (one per device).
+    .PARAMETER DebounceWeeks
+        Gap threshold value (in weeks) that was used — displayed in the header.
+    .PARAMETER MaxWidth
+        Maximum bar width in characters. Default: 72 (fits standard 80-col terminal).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][PSCustomObject[]]$GapResults,
+        [int]$DebounceWeeks = 4,
+        [int]$MaxWidth      = 72
+    )
+
+    $withData = @($GapResults | Where-Object { $_.OverallEarliest })
+    if ($withData.Count -eq 0) {
+        Write-Host '  (No date information available for any selected device)' -ForegroundColor DarkGray
+        return
+    }
+
+    # Global axis spanning all selected devices
+    $globalMin = @($withData | Select-Object -ExpandProperty OverallEarliest | Sort-Object)[0]
+    $globalMax = @($withData | Select-Object -ExpandProperty OverallLatest   | Sort-Object)[-1]
+
+    $minY = [int]$globalMin.Substring(0,4); $minM = [int]$globalMin.Substring(5,2)
+    $maxY = [int]$globalMax.Substring(0,4); $maxM = [int]$globalMax.Substring(5,2)
+    $totalMonths = ($maxY - $minY) * 12 + ($maxM - $minM) + 1
+    if ($totalMonths -lt 1) { $totalMonths = 1 }
+
+    $barWidth    = [Math]::Min($MaxWidth, $totalMonths)
+    $scaleDouble = if ($barWidth -gt 0) { [double]$totalMonths / [double]$barWidth } else { 1.0 }
+
+    # Scriptblock closure — captures $minY, $minM, $barWidth, $scaleDouble from this call frame
+    $gapPos = {
+        param([string]$dateStr)
+        $y   = [int]$dateStr.Substring(0,4)
+        $m   = [int]$dateStr.Substring(5,2)
+        $idx = [double](($y - $minY) * 12 + ($m - $minM))
+        $raw = if ($scaleDouble -gt 0) { $idx / $scaleDouble } else { 0.0 }
+        if ([double]::IsNaN($raw) -or [double]::IsInfinity($raw)) { $raw = 0.0 }
+        [Math]::Min($barWidth - 1, [Math]::Max(0, [int]([Math]::Floor($raw))))
+    }
+
+    # Build year-label axis string via StringBuilder (avoids char/string array edge cases).
+    # Allocate 3 extra chars so a year label whose tick falls near the right edge is not clipped.
+    $axisCap = $barWidth + 3
+    $axisBuilder = [System.Text.StringBuilder]::new(' ' * $axisCap)
+    $yrStr = $minY.ToString()
+    for ($li = 0; $li -lt $yrStr.Length -and $li -lt $axisCap; $li++) {
+        [void]$axisBuilder.Remove($li, 1)
+        [void]$axisBuilder.Insert($li, $yrStr[$li].ToString())
+    }
+    for ($yr = $minY + 1; $yr -le $maxY; $yr++) {
+        $mIdx = [double](($yr - $minY) * 12 - ($minM - 1))
+        $pos  = if ($scaleDouble -gt 0) { [int]([Math]::Floor($mIdx / $scaleDouble)) } else { 0 }
+        if ($pos -ge 0 -and $pos -lt $barWidth) {
+            $yrStr = $yr.ToString()
+            for ($li = 0; $li -lt $yrStr.Length -and ($pos + $li) -lt $axisCap; $li++) {
+                if ($axisBuilder[$pos + $li] -eq ' ') {
+                    [void]$axisBuilder.Remove($pos + $li, 1)
+                    [void]$axisBuilder.Insert($pos + $li, $yrStr[$li].ToString())
+                }
+            }
+        }
+    }
+    $axisStr = $axisBuilder.ToString().TrimEnd()
+
+    # Summary header
+    $totalReal      = @($GapResults | ForEach-Object { $_.Gaps } | Where-Object { -not $_.IsDebounced }).Count
+    $totalDebounced = @($GapResults | ForEach-Object { $_.Gaps } | Where-Object {  $_.IsDebounced }).Count
+    $lineWidth      = [Math]::Min(18 + 1 + $barWidth + 26, 100)
+
+    Write-Host ''
+    Write-Host ('═' * $lineWidth) -ForegroundColor Cyan
+    Write-Host '  GAP ANALYSIS — DEVICE SWIM LANES' -ForegroundColor Cyan
+    Write-Host ('═' * $lineWidth) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "  $($GapResults.Count) device(s)   $totalReal real gap(s)   $totalDebounced debounced   threshold ≤$DebounceWeeks week(s)" -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Legend: ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '█' -NoNewline -ForegroundColor Green
+    Write-Host ' data  '          -NoNewline -ForegroundColor DarkGray
+    Write-Host '▓' -NoNewline -ForegroundColor Magenta
+    Write-Host ' contaminated  '  -NoNewline -ForegroundColor DarkGray
+    Write-Host '░' -NoNewline -ForegroundColor Red
+    Write-Host ' gap  '           -NoNewline -ForegroundColor DarkGray
+    Write-Host '▒' -NoNewline -ForegroundColor DarkYellow
+    Write-Host " noise (≤$DebounceWeeks wk)" -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host ('─' * $lineWidth) -ForegroundColor DarkGray
+    Write-Host ($('Device'.PadRight(18)) + ' ' + $axisStr) -ForegroundColor DarkGray
+    Write-Host ('─' * $lineWidth) -ForegroundColor DarkGray
+
+    foreach ($gapResult in $GapResults) {
+        $sn = $gapResult.DeviceSerial
+
+        if (-not $gapResult.OverallEarliest) {
+            Write-Host ($sn.PadRight(18) + ' (no monthly AD/DD data found)') -ForegroundColor DarkGray
+            Write-Host ''
+            continue
+        }
+
+        # Build bar as char array (one character per bar position)
+        $bar = [char[]](' ' * $barWidth)
+
+        # Paint covered months — clean (█) wins over contaminated-only (▓)
+        foreach ($month in $gapResult.CoveredMonths) {
+            $pos = & $gapPos $month
+            $ch  = if ($gapResult.ContaminatedMonths -contains $month) { [char]'▓' } else { [char]'█' }
+            if ($bar[$pos] -eq [char]' ' -or ($bar[$pos] -eq [char]'▓' -and $ch -eq [char]'█')) {
+                $bar[$pos] = $ch
+            }
+        }
+
+        # Paint gaps — only positions not already occupied by data
+        foreach ($gap in $gapResult.Gaps) {
+            $gapCh = if ($gap.IsDebounced) { [char]'▒' } else { [char]'░' }
+            foreach ($month in $gap.Months) {
+                $pos = & $gapPos $month
+                if ($bar[$pos] -eq [char]' ') { $bar[$pos] = $gapCh }
+            }
+        }
+
+        # Print: label + colored bar + date range
+        $snLabel = $sn.Substring(0, [Math]::Min(17, $sn.Length))
+        Write-Host ($snLabel.PadRight(18) + ' ') -NoNewline -ForegroundColor Cyan
+        foreach ($ch in $bar) {
+            $color = switch ([string]$ch) {
+                '█'     { 'Green'      }
+                '▓'     { 'Magenta'    }
+                '░'     { 'Red'        }
+                '▒'     { 'DarkYellow' }
+                default { 'DarkGray'   }
+            }
+            Write-Host $ch -NoNewline -ForegroundColor $color
+        }
+        Write-Host "  $($gapResult.OverallEarliest) → $($gapResult.OverallLatest)" -ForegroundColor Cyan
+
+        # Detail lines below the bar
+        $realGaps      = @($gapResult.Gaps | Where-Object { -not $_.IsDebounced })
+        $debouncedGaps = @($gapResult.Gaps | Where-Object {  $_.IsDebounced })
+
+        foreach ($g in $realGaps) {
+            $mWord = if ($g.DurationMonths -eq 1) { '1 month' } else { "$($g.DurationMonths) months" }
+            Write-Host "              ↳ GAP  $($g.Start) → $($g.End)  [$mWord / ~$($g.DurationWeeks) weeks]" -ForegroundColor Red
+        }
+        if ($debouncedGaps.Count -gt 0) {
+            Write-Host "              ↳ $($debouncedGaps.Count) noise gap(s) ≤$DebounceWeeks week(s) — not shown" -ForegroundColor DarkYellow
+        }
+        if ($gapResult.ContaminatedMonths.Count -gt 0) {
+            Write-Host "              ↳ $($gapResult.ContaminatedMonths.Count) month(s) covered only by contaminated backup(s)" -ForegroundColor Magenta
+        }
+        if ($realGaps.Count -eq 0 -and $debouncedGaps.Count -eq 0 -and $gapResult.ContaminatedMonths.Count -eq 0) {
+            Write-Host '              ↳ Complete — no gaps detected' -ForegroundColor Green
+        }
+        Write-Host ''
+    }
+
+    Write-Host ('─' * $lineWidth) -ForegroundColor DarkGray
+    Write-Host "  Axis: $globalMin → $globalMax  ($totalMonths months total)" -ForegroundColor DarkGray
+    Write-Host ''
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Show-MainMenu',
     'Show-SourcePicker',
@@ -460,5 +639,6 @@ Export-ModuleMember -Function @(
     'Show-DeviceSelection',
     'Show-ForceDevicesPrompt',
     'Write-ProgressBar',
-    'Write-TimelineChart'
+    'Write-TimelineChart',
+    'Show-GapSwimLanes'
 )

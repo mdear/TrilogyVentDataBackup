@@ -15,6 +15,8 @@ Trilogy 200 ventilator data from SD cards.
 - **Creates golden archives** — one clean, verified copy of all data per device,
   ready to hand to a clinician or load into DirectView
 - **Prepares SD cards** for clinic visits with only the data the clinician needs
+- **Gap Analysis** — shows a chronological swim lane per device so you can see at a
+  glance which months of therapy data are missing across all your backups
 
 ---
 
