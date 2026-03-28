@@ -369,7 +369,7 @@ Renders the Table of Contents to the console:
 
 ## VBM-GoldenArchive.psm1
 
-### `New-GoldenArchive -TOC <obj> -GoldenRoot <path> [-Devices <string[]>] [-ForceDevices <string[]>] [-ForceReason <string>]`
+### `New-GoldenArchive -TOC <obj> -GoldenRoot <path> [-Devices <string[]>] [-ForceDevices <string[]>] [-ForceReason <string>] [-FromDate <string>] [-ToDate <string>]`
 Builds the first golden archive.
 
 **Algorithm**:
@@ -413,7 +413,44 @@ parameter. `$ForceReason` is recorded in `manifest.json` as `forcedDevicesReason
 Both `-ForceDevices` and `-ForceReason` should be supplied together; if only
 `-ForceDevices` is given, a generic reason is recorded.
 
-### `Update-GoldenArchive -TOC <obj> -GoldenRoot <path> -PreviousGolden <path> [-ForceDevices <string[]>] [-ForceReason <string>]`
+**Date range filter** (`-FromDate` / `-ToDate`, both optional YYYY-MM-DD strings):
+When supplied, files outside the inclusive range are skipped during the gather phase
+(`_GatherTrilogyFiles`, `_GatherPSeriesFiles`). The filter uses an **overlap** test
+rather than a containment test: a file is included if its covered date range
+*intersects* the requested window, not only if it falls wholly inside it.
+
+**Sub-monthly filter limitation (important)**: `AD_`/`DD_` EDF files are monthly
+binary blobs produced by the ventilator — one file covers the entire calendar month
+and cannot be split. `_ExtractFileDateRange` maps `AD_202602_000.edf` to the span
+`2026-02-01 → 2026-02-28`. If the user specifies `-FromDate 2026-02-15`, that file
+still passes the overlap test (its end `2026-02-28` ≥ `2026-02-15`) and is included
+in full. **Exact-day precision is only achievable for**:
+- `WD_YYYYMMDD_NNN.edf` — daily waveform EDF (single-day span)
+- `PP_YYYYMMDD_NNN.json` — P-Series per-session ring-buffer files
+- `EL_{SN}_{YYYYMMDD}.csv` — event-log CSV files
+
+Files with no date encoding (BIN, prop.txt, FILES.SEQ, SL_SAPPHIRE.json, etc.) are
+never filtered — they always pass regardless of the window.
+
+**Tip-file corollary (active month)**: When the golden is built mid-month, the
+current month's `AD_`/`DD_` EDF is a *tip file* still being written by the
+ventilator. Its `NumDataRecords` field is `"-1"` (valid per EDF+ spec — unknown at
+write time). It contains real therapy data up to the backup date, not to the nominal
+last day of the month. `_ExtractFileDateRange` has no way to detect this; it always
+assigns the nominal span `YYYY-MM-01 → YYYY-MM-{lastDay}` from `DaysInMonth()`.
+
+Consequence: suppose today is 2026-02-21 and the user requests
+`-FromDate 2026-02-01 -ToDate 2026-02-15`. `AD_202602_000.edf` nominally spans
+`2026-02-01 → 2026-02-28`, passes the overlap test, and is written into the golden
+*in full* — carrying data for Feb 16–21 that lies beyond the stated `-ToDate`. There
+is no mechanism to truncate a binary EDF after Feb 15; the whole file is atomic.
+
+The same asymmetry applies to the lower bound: a `-FromDate` mid-month will pull in
+the entire month's `AD_`/`DD_` data even if the first half of the month precedes the
+requested start. In neither direction can the filter enforce an intra-month boundary
+on these files.
+
+### `Update-GoldenArchive -TOC <obj> -GoldenRoot <path> -PreviousGolden <path> [-ForceDevices <string[]>] [-ForceReason <string>] [-FromDate <string>] [-ToDate <string>]`
 Builds an incremental golden.
 
 **Algorithm**:
@@ -623,12 +660,31 @@ write operation across the entire toolset.
 - `Read-YesNo -Prompt <string> [-Default <bool>]` → boolean
 - `Show-DeviceSelection -Devices <hashtable> -Suggested <string[]>` → selected SN array
 - `Show-ForceDevicesPrompt -Devices <hashtable>` → `@{ ForceDevices=$true/$false; SelectedSNs=@(...); Reason="..." }`
+- `Show-DateRangePrompt` → `@{ HasFilter; FromDate; ToDate }` — optional inclusive YYYY-MM-DD window prompt
+- `Show-GoldenDeviceMenu -Devices <hashtable> -Suggested <string[]> [-IsFirstGolden]` → `@{ SelectedSNs; IsCustom; Reason; FromDate; ToDate }` — unified R)ecommended / C)ustom device + date picker
 - `Write-ProgressBar -Activity <string> -Current <int> -Total <int>`
 - `Write-TimelineChart -DeviceTimeline <obj>` → ASCII bar chart to console
   **Note**: `Show-TOC` (in VBM-Analyzer) contains its own inline timeline renderer
   appropriate for the full TOC summary view. `Write-TimelineChart` is a general-purpose
   chart for single-device or caller-assembled timelines and is not called by `Show-TOC`.
 - `Show-GapSwimLanes -GapResults <PSCustomObject[]> [-DebounceWeeks <int>] [-MaxWidth <int>]` → swim lane display
+
+### `Show-DateRangePrompt` Behavior
+Prompts for an optional inclusive `FromDate` / `ToDate` pair (both YYYY-MM-DD).
+Either bound may be left blank (no restriction on that side).
+
+**Mid-month boundary warnings**: immediately after a date is accepted, the function
+checks whether it falls at a natural month boundary:
+- **From date**: if the day is not `01`, a yellow `[!]` warning is printed stating
+  that all AD_/DD_ monthly therapy files for that month will be included in full.
+- **To date**: if the day is not the last day of its month (computed via
+  `DaysInMonth()`), the same warning is printed for the end month.
+
+The warning explains the asymmetry: monthly binary EDF files (`AD_`/`DD_`) span
+the entire calendar month and cannot be split — the mid-month boundary is honoured
+only for daily files (`WD_`, `PP_`, `EL_`). The return value is unaffected; the
+exact date the user entered is preserved and passed to `_GatherTrilogyFiles` /
+`_GatherPSeriesFiles`.
 
 ### `Show-DeviceSelection` Behavior
 Presents the device list with a pre-selected suggestion:
@@ -709,6 +765,10 @@ param(
     [string[]]$ForceDevices,
     [string]$ForceReason,
 
+    # Date range filter for golden archive (both optional, inclusive, YYYY-MM-DD)
+    [string]$FromDate,
+    [string]$ToDate,
+
     # Export / Prepare
     [string]$GoldenPath,
     [string]$Target,
@@ -723,7 +783,12 @@ If no parameters → wizard mode via `Show-MainMenu` loop.
 
 `-ForceDevices` and `-ForceReason` are forwarded to `New-GoldenArchive` or
 `Update-GoldenArchive` when the `Golden` or `Prepare` action is invoked from CLI.
-In wizard mode, these come from `Show-ForceDevicesPrompt` instead.
+In wizard mode, these come from `Show-GoldenDeviceMenu` instead.
+
+`-FromDate` and `-ToDate` are forwarded to `New-GoldenArchive` or
+`Update-GoldenArchive` when the `Golden` or `Prepare` action is invoked from CLI.
+In wizard mode, the date bounds come from `Show-GoldenDeviceMenu` → `Show-DateRangePrompt`
+(available on the Custom path only; the Recommended path carries no date filter).
 
 ### First-Run Setup (`_CheckDesktopShortcut`)
 
@@ -762,11 +827,11 @@ Analyze:    BackupRoot → Get-BackupInventory → Get-BackupTOC → Show-TOC
                                              → Find-SplitSD (annotates TOC.Devices[*].SplitSD)
 
 Prepare:    BackupRoot → Get-BackupTOC → Find-SplitSD
-(wizard)               → Show-ForceDevicesPrompt
-                          → [force=N] Show-DeviceSelection (suggest changed-or-new devices)
-                          → [force=Y] use ForceDevices SNs + ForceReason
-                       → [if no golden] New-GoldenArchive(-ForceDevices, -ForceReason)
-                       → [if golden exists] Update-GoldenArchive(-ForceDevices, -ForceReason)
+(wizard)               → Show-GoldenDeviceMenu
+                          → [R] recommended SNs, no date filter
+                          → [C] custom SNs + audit note + optional Show-DateRangePrompt
+                       → [if no golden] New-GoldenArchive(-ForceDevices, -ForceReason, -FromDate, -ToDate)
+                       → [if golden exists] Update-GoldenArchive(-ForceDevices, -ForceReason, -FromDate, -ToDate)
                        → Show-TargetContents → confirm → Export-ToTarget
 
 Backup:     Source → Import-SDCard (copy + hash-verify inline) → Get-BackupTOC → Show-TOC

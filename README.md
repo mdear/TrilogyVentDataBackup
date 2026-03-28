@@ -176,10 +176,33 @@ When building a golden archive (via **Prepare** or **Golden Archive** in the wiz
 or via the `-Action Golden` / `-Action Prepare` CLI flags), you can optionally restrict
 which data is included using an **inclusive date range**.
 
-- **What it filters**: EDF therapy-data files (AD_/DD_/WD_) and P-Series per-session
-  (PP) files whose month falls outside the specified range are excluded from all
-  selected devices.  Device identity files (prop.txt, FILES.SEQ, SL_SAPPHIRE.json,
+- **What it filters**: EDF therapy-data files and P-Series per-session (PP) files
+  whose covered date range does not overlap the specified window are excluded from
+  all selected devices.  Device identity files (prop.txt, FILES.SEQ, SL_SAPPHIRE.json,
   etc.) are always included regardless of the date range.
+- **Monthly granularity limit — important**: `AD_` and `DD_` EDF files are created
+  by the ventilator one per calendar month and cannot be split.  A mid-month boundary
+  such as `-FromDate 2026-02-15` will still include the **entire** February monthly
+  files (`AD_202602_000.edf` / `DD_202602_000.edf`) because those files span
+  2026-02-01 through 2026-02-28 and that span overlaps the requested window.  You
+  will always receive whole calendar months for the main therapy-data files.
+  Only daily files support exact-day precision:
+  - `WD_YYYYMMDD_*.edf` — daily waveform recordings
+  - `PP_YYYYMMDD_*.json` — P-Series per-session ring-buffer files
+  - `EL_{SN}_{YYYYMMDD}.csv` — event-log CSV files
+
+- **Active-month tip-file caveat**: When the golden is built during a month that is
+  still in progress, the current month's `AD_`/`DD_` file is a *tip file* — it is
+  still being written by the ventilator and contains real therapy data up to the
+  backup date, not to the last day of the month.  The tool has no way to read how
+  far into the month the data actually runs, so it treats the file as covering the
+  whole calendar month.  Example: today is Feb 21, 2026 and you request
+  `-FromDate 2026-02-01 -ToDate 2026-02-15`.  The February tip file is included
+  (it overlaps the window), but it contains therapy data through Feb 21 — a full six
+  days beyond your stated end date.  The file is an atomic binary; those extra days
+  cannot be stripped out.  If exact containment within Feb 1–15 is required, the
+  golden should be built from a backup taken **on or before Feb 15** rather than one
+  taken later in the month.
 - **Self-consistency guaranteed**: After filtering, the standard pairing and rewind
   rules still run, so the resulting golden archive is always internally consistent
   and passes integrity and content validation.

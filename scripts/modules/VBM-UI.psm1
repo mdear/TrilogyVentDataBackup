@@ -642,6 +642,13 @@ function Show-DateRangePrompt {
         Both bounds are optional — leaving either blank imposes no restriction on
         that side.  When no dates are entered, the result HasFilter=$false and
         the caller should apply no date restriction.
+
+        When the accepted From date is not the 1st of its month, or the accepted
+        To date is not the last day of its month, an inline warning is printed
+        immediately after the prompt explaining that AD_/DD_ monthly therapy files
+        span the full calendar month and will be included in full despite the
+        mid-month boundary.  Daily WD_/EL_/PP_ files honour the exact day.  The
+        return value is not affected — the date the user entered is preserved as-is.
     .OUTPUTS
         PSCustomObject:
           HasFilter  [bool]   — $true if at least one bound was supplied
@@ -669,7 +676,18 @@ function Show-DateRangePrompt {
         if ($raw -eq '') { break }
         if ($raw -match '^\d{4}-\d{2}-\d{2}$') {
             $__dt = [datetime]::MinValue
-            if ([datetime]::TryParse($raw, [ref]$__dt)) { $fromDate = $raw; break }
+            if ([datetime]::TryParse($raw, [ref]$__dt)) {
+                $fromDate = $raw
+                if ($__dt.Day -ne 1) {
+                    Write-Host ''
+                    Write-Host '  [!] Mid-month start date — AD_/DD_ monthly therapy files cover the' -ForegroundColor Yellow
+                    Write-Host "      full calendar month and cannot be split.  All of $($__dt.ToString('MMMM yyyy'))'s" -ForegroundColor Yellow
+                    Write-Host '      AD_/DD_ files will be included regardless of this start day.' -ForegroundColor Yellow
+                    Write-Host '      Daily WD_/EL_/PP_ files will be filtered to start on this date.' -ForegroundColor Yellow
+                    Write-Host ''
+                }
+                break
+            }
         }
         Write-Host '  Invalid format — use YYYY-MM-DD (e.g. 2024-03-01).' -ForegroundColor Yellow
     }
@@ -685,7 +703,17 @@ function Show-DateRangePrompt {
                     Write-Host "  To date '$raw' is before From date '$fromDate' — please re-enter." -ForegroundColor Yellow
                     continue
                 }
-                $toDate = $raw; break
+                $toDate = $raw
+                $lastDay = [System.DateTime]::DaysInMonth($__dt.Year, $__dt.Month)
+                if ($__dt.Day -ne $lastDay) {
+                    Write-Host ''
+                    Write-Host '  [!] Mid-month end date — AD_/DD_ monthly therapy files cover the' -ForegroundColor Yellow
+                    Write-Host "      full calendar month and cannot be split.  All of $($__dt.ToString('MMMM yyyy'))'s" -ForegroundColor Yellow
+                    Write-Host '      AD_/DD_ files will be included regardless of this end day.' -ForegroundColor Yellow
+                    Write-Host '      Daily WD_/EL_/PP_ files will be filtered to end on this date.' -ForegroundColor Yellow
+                    Write-Host ''
+                }
+                break
             }
         }
         Write-Host '  Invalid format — use YYYY-MM-DD (e.g. 2024-03-01).' -ForegroundColor Yellow
