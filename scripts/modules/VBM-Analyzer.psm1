@@ -8,10 +8,12 @@ Import-Module (Join-Path $PSScriptRoot 'VBM-Parsers.psm1') -Force
 function _NewDeviceSlot {
     param([string]$SN, [string]$ActiveDevice)
     return @{
-        TrilogyFiles   = [System.Collections.Generic.List[object]]::new()
-        PSeriesFiles   = [System.Collections.Generic.List[object]]::new()
-        EarliestDate   = $null
-        LatestDate     = $null
+        TrilogyFiles    = [System.Collections.Generic.List[object]]::new()
+        PSeriesFiles    = [System.Collections.Generic.List[object]]::new()
+        EarliestDate    = $null
+        LatestDate      = $null
+        EarliestDayDate = $null
+        LatestDayDate   = $null
         FileCount      = 0
         Model          = $null
         ProductType    = $null
@@ -22,13 +24,19 @@ function _NewDeviceSlot {
 
 function _UpdateDateRange {
     param([hashtable]$Device, [int]$Year, [int]$Month)
-    $ds = '{0:D4}-{1:D2}' -f $Year, $Month
-    if (-not $Device['EarliestDate'] -or $ds -lt $Device['EarliestDate']) {
-        $Device['EarliestDate'] = $ds
-    }
-    if (-not $Device['LatestDate'] -or $ds -gt $Device['LatestDate']) {
-        $Device['LatestDate'] = $ds
-    }
+    $ym = '{0:D4}-{1:D2}' -f $Year, $Month
+    if (-not $Device['EarliestDate'] -or $ym -lt $Device['EarliestDate']) { $Device['EarliestDate'] = $ym }
+    if (-not $Device['LatestDate']   -or $ym -gt $Device['LatestDate'])   { $Device['LatestDate']   = $ym }
+}
+
+# Track exact-day dates from daily files (WD/EL/PP/BIN).  Only used to extend
+# EarliestDate/LatestDate into months with no AD/DD coverage; within a month
+# already covered by AD/DD the month string (YYYY-MM) is preserved as-is.
+function _UpdateDayDateRange {
+    param([hashtable]$Device, [int]$Year, [int]$Month, [int]$Day)
+    $ds = '{0:D4}-{1:D2}-{2:D2}' -f $Year, $Month, $Day
+    if (-not $Device['EarliestDayDate'] -or $ds -lt $Device['EarliestDayDate']) { $Device['EarliestDayDate'] = $ds }
+    if (-not $Device['LatestDayDate']   -or $ds -gt $Device['LatestDayDate'])   { $Device['LatestDayDate']   = $ds }
 }
 
 function _ScanBackupFolder {
@@ -73,6 +81,13 @@ function _ScanBackupFolder {
                     FileName     = $pf.Name
                     Size         = $pf.Length
                 })
+                # PP_ JSON filenames carry exact-day precision
+                if ($pf.Name -match '^PP_') {
+                    $ppDate = Get-PpJsonDateInfo -Path $pf.FullName
+                    if ($ppDate) {
+                        _UpdateDayDateRange -Device $devices[$sn] -Year $ppDate.Year -Month $ppDate.Month -Day $ppDate.Day
+                    }
+                }
             }
         }
     }
@@ -85,6 +100,8 @@ function _ScanBackupFolder {
 
             $sn       = $null
             $dateInfo = $null
+            $binInfo  = $null
+            $elInfo   = $null
 
             if ($ext -eq '.edf') {
                 $sn       = Get-EdfDeviceSerial -Path $tf.FullName
@@ -124,9 +141,18 @@ function _ScanBackupFolder {
                 }
             }
 
-            # Monthly date range (AD/DD only; WD is daily and noisier)
+            # Monthly date range from AD/DD EDF files
             if ($dateInfo -and -not $dateInfo.IsDaily -and $dateInfo.Year -and $dateInfo.Month) {
                 _UpdateDateRange -Device $devices[$sn] -Year $dateInfo.Year -Month $dateInfo.Month
+            }
+            # Day-level date range from daily files (WD/PD/PA EDF, EL CSV, BIN)
+            if ($dateInfo -and $dateInfo.IsDaily -and $dateInfo.Year -and $dateInfo.Month -and $dateInfo.Day) {
+                _UpdateDayDateRange -Device $devices[$sn] -Year $dateInfo.Year -Month $dateInfo.Month -Day $dateInfo.Day
+            } elseif ($elInfo -and $elInfo.DateString -match '^(\d{4})(\d{2})(\d{2})$') {
+                _UpdateDayDateRange -Device $devices[$sn] -Year ([int]$Matches[1]) -Month ([int]$Matches[2]) -Day ([int]$Matches[3])
+            } elseif ($binInfo -and $binInfo.DateTime) {
+                $dt = $binInfo.DateTime
+                _UpdateDayDateRange -Device $devices[$sn] -Year $dt.Year -Month $dt.Month -Day $dt.Day
             }
         }
     }
@@ -137,11 +163,28 @@ function _ScanBackupFolder {
         $d        = $devices[$sn]
         $triArray = $d['TrilogyFiles'].ToArray()
         $psArray  = $d['PSeriesFiles'].ToArray()
+
+        # Extend YYYY-MM range with day-precision dates ONLY when the day falls in a
+        # month outside the AD/DD monthly coverage — within the same month the month
+        # string is more semantically correct (the AD/DD file covers the whole month).
+        $mEarliest = $d['EarliestDate']
+        $mLatest   = $d['LatestDate']
+        $dEarliest = $d['EarliestDayDate']
+        $dLatest   = $d['LatestDayDate']
+        if ($dEarliest) {
+            $dEarlyYM = $dEarliest.Substring(0, 7)
+            if (-not $mEarliest -or $dEarlyYM -lt $mEarliest) { $mEarliest = $dEarliest }
+        }
+        if ($dLatest) {
+            $dLatestYM = $dLatest.Substring(0, 7)
+            if (-not $mLatest -or $dLatestYM -gt $mLatest) { $mLatest = $dLatest }
+        }
+
         $deviceObjs[$sn] = [PSCustomObject]@{
             TrilogyFiles   = $triArray
             PSeriesFiles   = $psArray
-            EarliestDate   = $d['EarliestDate']
-            LatestDate     = $d['LatestDate']
+            EarliestDate   = $mEarliest
+            LatestDate     = $mLatest
             FileCount      = $triArray.Count + $psArray.Count
             Model          = $d['Model']
             ProductType    = $d['ProductType']
@@ -168,10 +211,18 @@ function Get-BackupInventory {
     <#
     .SYNOPSIS
         Discover all backup folders under BackupRoot.
-        Returns array of PSObjects: Name, Path, HasTrilogy, HasPSeries, SubBackups.
+        Returns array of PSObjects: Name, Path, HasTrilogy, HasPSeries, SubBackups, IsGolden.
+    .PARAMETER IncludeGoldens
+        When set, _golden_* directories are included in the inventory so that
+        Get-BackupTOC can analyse their date ranges alongside regular backups.
+        Each golden appears as a top-level entry whose SubBackups are the per-SN
+        subdirectories inside the golden folder.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$BackupRoot)
+    param(
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [switch]$IncludeGoldens
+    )
 
     # ── Edge case 19: Dropbox Smart Sync warning ───────────────────────────
     # Files may be "online only" and inaccessible. Warn so the user can make
@@ -194,10 +245,51 @@ function Get-BackupInventory {
         $name = $item.Name
 
         # Exclusion patterns per DESIGN.md
-        if ($name -eq 'scripts')          { continue }
-        if ($name -match '^_golden_')     { continue }
-        if ($name -match '^[._]')         { continue }
-        if ($name -eq 'nul')              { continue }
+        if ($name -eq 'scripts')      { continue }
+        if ($name -eq 'nul')          { continue }
+        # dot-prefixed hidden dirs (but not _golden_ which starts with _)
+        if ($name -match '^\.')       { continue }
+
+        $isGolden = $name -match '^_golden_'
+
+        if ($isGolden) {
+            # Golden archives are only included when -IncludeGoldens is set and have a
+            # valid manifest.json.  Each per-SN subdirectory becomes a sub-backup entry.
+            if (-not $IncludeGoldens) { continue }
+            $manifestPath = Join-Path $item.FullName 'manifest.json'
+            if (-not (Test-Path $manifestPath)) { continue }
+
+            $subList = [System.Collections.Generic.List[object]]::new()
+            foreach ($snDir in Get-ChildItem -LiteralPath $item.FullName -Directory -ErrorAction SilentlyContinue) {
+                $sHasT = Test-Path (Join-Path $snDir.FullName 'Trilogy')
+                $sHasP = Test-Path (Join-Path $snDir.FullName 'P-Series')
+                if ($sHasT -or $sHasP) {
+                    $subList.Add([PSCustomObject]@{
+                        Name       = "$name/$($snDir.Name)"
+                        Path       = $snDir.FullName
+                        HasTrilogy = $sHasT
+                        HasPSeries = $sHasP
+                        SubBackups = @()
+                        IsGolden   = $true
+                    })
+                }
+            }
+            if ($subList.Count -eq 0) { continue }
+
+            $results.Add([PSCustomObject]@{
+                Name       = $name
+                Path       = $item.FullName
+                HasTrilogy = $false
+                HasPSeries = $false
+                SubBackups = $subList.ToArray()
+                IsGolden   = $true
+            })
+            continue
+        }
+
+        # ── Regular backup (unchanged logic) ───────────────────────────────
+        # Underscore-prefixed non-golden dirs are excluded
+        if ($name -match '^_')        { continue }
 
         $hasT = Test-Path (Join-Path $item.FullName 'Trilogy')
         $hasP = Test-Path (Join-Path $item.FullName 'P-Series')
@@ -218,6 +310,7 @@ function Get-BackupInventory {
                     HasTrilogy = $sHasT
                     HasPSeries = $sHasP
                     SubBackups = @()
+                    IsGolden   = $false
                 })
             }
         }
@@ -231,6 +324,7 @@ function Get-BackupInventory {
             HasTrilogy = $hasT
             HasPSeries = $hasP
             SubBackups = $subList.ToArray()
+            IsGolden   = $false
         })
     }
 
@@ -246,6 +340,24 @@ function Get-BackupTOC {
     .SYNOPSIS
         Scan all backups and build the full data model (TOC).
         Automatically runs integrity checks after scanning.
+    .OUTPUTS
+        PSCustomObject with:
+          Backups  hashtable: backup-name -> PSCustomObject {
+                     Devices  hashtable: SN -> PSCustomObject {
+                       EarliestDate  string or $null
+                                     'YYYY-MM'    when only AD/DD monthly files are present
+                                     'YYYY-MM-DD' when a daily file (WD/PD/PA EDF, EL CSV,
+                                                  PP JSON, or BIN) extends the range beyond
+                                                  the AD/DD monthly coverage
+                       LatestDate    string or $null  (same format rules as EarliestDate)
+                       TrilogyFiles, PSeriesFiles, FileCount, Model, ProductType,
+                       Firmware, IsActiveDevice
+                     }
+                     Integrity, Anomalies, IsGolden, ActiveDevice }
+          Devices  hashtable: SN -> PSCustomObject {
+                     OverallEarliest  string or $null (same mixed-precision format)
+                     OverallLatest    string or $null (same mixed-precision format)
+                     BackupPresence, TotalUniqueFiles, Model, ProductType }
     #>
     [CmdletBinding()]
     param(
@@ -262,20 +374,25 @@ function Get-BackupTOC {
         foreach ($sub in $entry.SubBackups) { $allEntries.Add($sub) }
     }
 
-    $total = $allEntries.Count
-    $i     = 0
+    $total          = $allEntries.Count
+    $nonGoldenCount = @($allEntries | Where-Object { -not ($_.PSObject.Properties['IsGolden'] -and $_.IsGolden) }).Count
+    $i              = 0
     foreach ($entry in $allEntries) {
         $i++
         if ($ProgressCallback) {
             & $ProgressCallback "Scanning $($entry.Name)" $i $total
         }
         $detail = _ScanBackupFolder -BackupEntry $entry
+        # Tag the TOC entry so Show-TOC and analysis functions can identify goldens
+        $isGoldenEntry = ($entry.PSObject.Properties['IsGolden'] -and $entry.IsGolden)
+        $detail | Add-Member -NotePropertyName IsGolden -NotePropertyValue $isGoldenEntry -Force
         $backups[$entry.Name] = $detail
     }
 
-    # ── Cross-backup device aggregation ───────────────────────────────────
+    # ── Cross-backup device aggregation (regular backups only; goldens are derived) ──
     $devAgg = @{}
     foreach ($bName in $backups.Keys) {
+        if ($backups[$bName].IsGolden) { continue }   # skip golden entries
         foreach ($sn in $backups[$bName].Devices.Keys) {
             if (-not $devAgg.ContainsKey($sn)) {
                 $devAgg[$sn] = @{
@@ -323,16 +440,23 @@ function Get-BackupTOC {
         Devices = $devicesSummary
     }
 
-    # ── Run integrity tests (requires full TOC for cross-backup comparisons)
+    # ── Run integrity tests (regular backups only; goldens are verified at build time) ─
     $j = 0
     foreach ($bName in $backups.Keys) {
+        if ($backups[$bName].IsGolden) { continue }   # goldens: no integrity re-check
         $j++
         if ($ProgressCallback) {
-            & $ProgressCallback "Checking integrity: $bName" ($total + $j) ($total * 2)
+            & $ProgressCallback "Checking integrity: $bName" ($total + $j) ($total + $nonGoldenCount)
         }
         $result = Test-BackupIntegrity -BackupDetail $backups[$bName] -TOC $toc
         $backups[$bName].Integrity = $result.Integrity
         $backups[$bName].Anomalies = $result.Anomalies
+    }
+    # Mark golden entries with a synthetic integrity so Show-TOC can colour them distinctly
+    foreach ($bName in $backups.Keys) {
+        if ($backups[$bName].IsGolden) {
+            $backups[$bName].Integrity = 'Golden'
+        }
     }
 
     return $toc
@@ -463,7 +587,8 @@ function Test-BackupIntegrity {
     foreach ($sn in $devices.Keys) {
         foreach ($f in $devices[$sn].TrilogyFiles) {
             foreach ($otherName in $TOC.Backups.Keys) {
-                if ($otherName -eq $backupName) { continue }
+                if ($otherName -eq $backupName)        { continue }
+                if ($TOC.Backups[$otherName].IsGolden)  { continue }
                 $other = $TOC.Backups[$otherName]
                 if (-not $other.Devices.ContainsKey($sn)) { continue }
                 $match = $other.Devices[$sn].TrilogyFiles |
@@ -520,8 +645,9 @@ function Test-BackupIntegrity {
             $maxEntry      = $null
             $maxBackupName = $null
             foreach ($otherName in $TOC.Backups.Keys) {
-                if ($otherName -eq $backupName)          { continue }
-                if ($otherName -match $nnnVariantPattern) { continue }   # skip variants of current
+                if ($otherName -eq $backupName)           { continue }
+                if ($otherName -match $nnnVariantPattern)  { continue }   # skip variants of current
+                if ($TOC.Backups[$otherName].IsGolden)     { continue }
                 $other = $TOC.Backups[$otherName]
                 if (-not $other.Devices.ContainsKey($sn)) { continue }
                 $otherEntry = $other.Devices[$sn].PSeriesFiles |
@@ -697,13 +823,13 @@ function Show-TOC {
     Write-Host '  VENT BACKUP MANAGER — TABLE OF CONTENTS' -ForegroundColor Cyan
     Write-Host ('═' * $w) -ForegroundColor Cyan
 
-    # ── Backup summary table ───────────────────────────────────────────────
+    # ── Backup summary table (regular backups only) ──────────────────────
     Write-Host ''
     Write-Host 'BACKUPS' -ForegroundColor Yellow
     Write-Host ('-' * $w)
     '{0,-26} {1,-13} {2}' -f 'Backup Folder', 'Integrity', 'Devices' | Write-Host -ForegroundColor DarkGray
     Write-Host ('-' * $w)
-    foreach ($bName in ($TOC.Backups.Keys | Sort-Object)) {
+    foreach ($bName in ($TOC.Backups.Keys | Where-Object { -not $TOC.Backups[$_].IsGolden } | Sort-Object)) {
         $b     = $TOC.Backups[$bName]
         $color = switch ($b.Integrity) {
             'Contaminated' { 'Red'   }
@@ -713,6 +839,57 @@ function Show-TOC {
         $snList = ($b.Devices.Keys | Sort-Object) -join ', '
         if ($snList.Length -gt 30) { $snList = $snList.Substring(0,27) + '...' }
         '{0,-26} {1,-13} {2}' -f $bName, $b.Integrity, $snList | Write-Host -ForegroundColor $color
+    }
+
+    # ── Golden archives section ────────────────────────────────────────────
+    # Group all _golden_*/SN sub-entries by their parent golden name
+    $goldenTopNames = @($TOC.Backups.Keys |
+        Where-Object { $_ -match '^_golden_' -and $_ -notmatch '/' } |
+        Sort-Object)
+    if ($goldenTopNames.Count -gt 0) {
+        Write-Host ''
+        Write-Host 'GOLDEN ARCHIVES' -ForegroundColor Yellow
+        Write-Host ('-' * $w)
+        foreach ($goldenName in $goldenTopNames) {
+            $goldenEntry  = $TOC.Backups[$goldenName]
+            $manifestPath = Join-Path $goldenEntry.Path 'manifest.json'
+            $seq = '?'; $created = '?'; $filterNote = ''
+            if (Test-Path $manifestPath) {
+                try {
+                    $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
+                    $seq     = $m.goldenSequence
+                    $created = $m.created
+                    if ($m.PSObject.Properties['dateFilter'] -and $m.dateFilter) {
+                        $from = if ($m.dateFilter.from) { $m.dateFilter.from } else { '*' }
+                        $to   = if ($m.dateFilter.to  ) { $m.dateFilter.to   } else { '*' }
+                        $filterNote = "  filter: $from → $to"
+                    }
+                } catch { }
+            }
+            Write-Host ''
+            Write-Host "  $goldenName  [seq=$seq  created=$created$filterNote]" -ForegroundColor Cyan
+
+            $subKeys = @($TOC.Backups.Keys | Where-Object { $_ -like "$goldenName/*" } | Sort-Object)
+            if ($subKeys.Count -eq 0) {
+                Write-Host '    (no device sub-folders found)' -ForegroundColor DarkGray
+            }
+            foreach ($subKey in $subKeys) {
+                $sub    = $TOC.Backups[$subKey]
+                $snName = ($subKey -split '/')[-1]
+                $dev    = if ($sub.Devices.ContainsKey($snName)) { $sub.Devices[$snName] } else { $null }
+                if ($dev) {
+                    $earliest  = if ($dev.EarliestDate) { $dev.EarliestDate } else { '?' }
+                    $latest    = if ($dev.LatestDate  ) { $dev.LatestDate   } else { '?' }
+                    $rangeStr  = "$earliest → $latest"
+                    $modelStr  = if ($dev.Model) { "  [$($dev.Model)]" } else { '' }
+                    $fileCount = $dev.TrilogyFiles.Count + $dev.PSeriesFiles.Count
+                    Write-Host ("    {0,-16}{1}  {2}  ({3} files)" -f $snName, $modelStr, $rangeStr, $fileCount) -ForegroundColor White
+                } else {
+                    Write-Host ("    {0,-16}  (no dated data)" -f $snName) -ForegroundColor Gray
+                }
+            }
+        }
+        Write-Host ''
     }
 
     # ── Per-device timeline ────────────────────────────────────────────────
@@ -777,6 +954,9 @@ function Find-SplitSD {
     .OUTPUTS
         Hashtable of SN -> @{ SplitSD=$true; Spans=@( @{BackupNames=@(); Earliest=""; Latest="" } ) }
         Only SNs where a split is detected are included.  All others are absent.
+        Earliest/Latest strings follow the same mixed-precision format as EarliestDate/LatestDate
+        on device entries (see Get-BackupTOC .OUTPUTS): 'YYYY-MM' when the range is derived from
+        monthly AD/DD files only, 'YYYY-MM-DD' when a daily file extends beyond monthly coverage.
     #>
     [CmdletBinding()]
     param(
@@ -793,7 +973,9 @@ function Find-SplitSD {
 
     $result = @{}
 
-    $cleanNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
+    $cleanNames = @($TOC.Backups.Keys | Where-Object {
+        $TOC.Backups[$_].Integrity -ne 'Contaminated' -and -not $TOC.Backups[$_].IsGolden
+    })
 
     foreach ($sn in $TOC.Devices.Keys) {
         # Collect (BackupName, Earliest, Latest) tuples from clean backups only
@@ -956,12 +1138,14 @@ function Get-DeviceGaps {
     .OUTPUTS
         PSCustomObject:
           DeviceSerial       string
-          OverallEarliest    'YYYY-MM' or $null
-          OverallLatest      'YYYY-MM' or $null
+          OverallEarliest    'YYYY-MM' or $null  — earliest covered month
+          OverallLatest      'YYYY-MM' or $null  — latest covered month
           CoveredMonths      string[]   sorted list of 'YYYY-MM' months with AD/DD data
           Gaps               PSCustomObject[]  {
-                               Start, End, DurationMonths, DurationWeeks,
-                               IsDebounced, Months }
+                               Start          'YYYY-MM' — first missing month
+                               End            'YYYY-MM' — last missing month
+                               DurationMonths, DurationWeeks, IsDebounced
+                               Months         string[]  — 'YYYY-MM' keys (for internal axis use) }
           ContaminatedMonths string[]   months covered only by contaminated backups
     #>
     [CmdletBinding()]
@@ -984,6 +1168,8 @@ function Get-DeviceGaps {
 
     foreach ($bName in $TOC.Backups.Keys) {
         $b = $TOC.Backups[$bName]
+        # Golden archives are derived from base backup data and are themselves subject to
+        # gap analysis — include them as clean coverage sources.
         if (-not $b.Devices.ContainsKey($DeviceSerial)) { continue }
         $dev     = $b.Devices[$DeviceSerial]
         $isClean = ($b.Integrity -ne 'Contaminated')
@@ -1081,9 +1267,141 @@ function Get-DeviceGaps {
 
 #endregion
 
+#region ── Get-CachedBackupTOC ───────────────────────────────────────────────
+
+function _ComputeInventoryFingerprint {
+    <#
+    .SYNOPSIS
+        Produce a stable SHA256 fingerprint of every file reachable from the
+        given inventory entries.  For regular backups, all files (path, size,
+        last-write time) are included.  For golden archives, only the manifest.json
+        metadata is included — enough to detect a newly created or deleted golden
+        without redundantly hashing the full golden file tree (which is derived
+        from regular backups anyway).
+        The fingerprint incorporates each file's full path, size, and last-write
+        timestamp so that any add/delete/modify is detected.
+    #>
+    param([array]$Inventory)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+
+    # Flatten all top-level and sub-backup paths (regular only)
+    $allPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $Inventory) {
+        if ($entry.PSObject.Properties['IsGolden'] -and $entry.IsGolden) { continue }
+        $allPaths.Add($entry.Path)
+        foreach ($sub in $entry.SubBackups) { $allPaths.Add($sub.Path) }
+    }
+
+    foreach ($dir in ($allPaths | Sort-Object)) {
+        # Also fingerprint the directory list itself so additions/removals are caught
+        foreach ($item in (Get-ChildItem -LiteralPath $dir -Recurse -ErrorAction SilentlyContinue | Sort-Object FullName)) {
+            if ($item.PSIsContainer) {
+                $lines.Add("D|$($item.FullName)")
+            } else {
+                # README.md is written by VBM itself (contamination report) — exclude it so
+                # the fingerprint is stable across Analyze runs even when a README is generated.
+                if ($item.Name -eq 'README.md') { continue }
+                $lines.Add("F|$($item.FullName)|$($item.Length)|$($item.LastWriteTimeUtc.Ticks)")
+            }
+        }
+    }
+
+    # Also fingerprint golden archive manifests so that creating or removing a
+    # golden invalidates the cache and the new entry appears in Show-TOC.
+    # Only the manifest metadata (path, size, timestamp) is included — not the
+    # full file tree — since golden file contents are derived from regular backups.
+    foreach ($entry in ($Inventory | Where-Object { $_.PSObject.Properties['IsGolden'] -and $_.IsGolden } | Sort-Object Name)) {
+        $lines.Add("G|$($entry.Name)")
+        $manifestPath = Join-Path $entry.Path 'manifest.json'
+        if (Test-Path $manifestPath) {
+            $mItem = Get-Item -LiteralPath $manifestPath -ErrorAction SilentlyContinue
+            if ($mItem) { $lines.Add("M|$manifestPath|$($mItem.Length)|$($mItem.LastWriteTimeUtc.Ticks)") }
+        }
+    }
+
+    $bytes  = [System.Text.Encoding]::UTF8.GetBytes($lines -join "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $hash   = $sha256.ComputeHash($bytes)
+    $sha256.Dispose()
+    return [System.BitConverter]::ToString($hash) -replace '-', ''
+}
+
+function Get-CachedBackupTOC {
+    <#
+    .SYNOPSIS
+        Return a TOC, using a cached version when the backup folders are unchanged.
+    .DESCRIPTION
+        Computes a fingerprint of every file in the (non-golden) backup folders.
+        If the fingerprint matches the one stored in .toc-cache\toc.fingerprint the
+        previous TOC is deserialised from .toc-cache\toc.clixml and returned
+        immediately — skipping the full scan & integrity pass.
+
+        When anything has changed (files added, removed, or modified since the last
+        call) the cache is invalidated, Get-BackupTOC is called normally, and the
+        result is saved to the cache for next time.
+
+        Pass -Force to always rebuild regardless of the fingerprint.
+    .PARAMETER BackupRoot
+        Root directory that contains the backup folders.  The cache is stored
+        under BackupRoot\.toc-cache\.
+    .PARAMETER Inventory
+        Array returned by Get-BackupInventory (may include golden entries).
+    .PARAMETER ProgressCallback
+        Forwarded to Get-BackupTOC when a rebuild is needed.
+    .PARAMETER Force
+        When set the cache is ignored and a full rebuild always runs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [Parameter(Mandatory)][array]$Inventory,
+        [scriptblock]$ProgressCallback,
+        [switch]$Force
+    )
+
+    $cacheDir         = Join-Path $BackupRoot '.toc-cache'
+    $fingerprintFile  = Join-Path $cacheDir 'toc.fingerprint'
+    $clixmlFile       = Join-Path $cacheDir 'toc.clixml'
+
+    $currentFP = _ComputeInventoryFingerprint -Inventory $Inventory
+
+    if (-not $Force -and (Test-Path $fingerprintFile) -and (Test-Path $clixmlFile)) {
+        $storedFP = (Get-Content -LiteralPath $fingerprintFile -Raw -ErrorAction SilentlyContinue).Trim()
+        if ($storedFP -eq $currentFP) {
+            Write-Host '  (TOC unchanged — loading from cache)' -ForegroundColor DarkGray
+            try {
+                $toc = Import-Clixml -LiteralPath $clixmlFile
+                return $toc
+            } catch {
+                Write-Warning "TOC cache read failed ($($_.Exception.Message)) — rebuilding."
+            }
+        } else {
+            Write-Host '  (changes detected — rebuilding TOC)' -ForegroundColor DarkGray
+        }
+    }
+
+    # Full rebuild
+    $toc = Get-BackupTOC -Inventory $Inventory -ProgressCallback $ProgressCallback
+
+    # Persist cache
+    try {
+        $null = New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction SilentlyContinue
+        Set-Content -LiteralPath $fingerprintFile -Value $currentFP -Encoding UTF8 -NoNewline
+        $toc | Export-Clixml -LiteralPath $clixmlFile -Depth 20 -Force
+    } catch {
+        Write-Warning "Could not write TOC cache: $($_.Exception.Message)"
+    }
+
+    return $toc
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Get-BackupInventory',
     'Get-BackupTOC',
+    'Get-CachedBackupTOC',
     'Test-BackupIntegrity',
     'Get-DeviceTimeline',
     'Get-DeviceGaps',

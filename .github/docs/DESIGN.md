@@ -260,7 +260,7 @@ For each backup, scans every file:
 - BIN files: parses filename for SN + timestamp
 - EL_ CSV: parses filename for SN + date
 - P-Series: reads last.txt, prop.txt, FILES.SEQ per device folder
-- PP JSON: reads timestamp and BlowerHours
+- PP JSON: reads timestamp, BlowerHours, and session date (from filename)
 
 Returns a TOC object:
 ```
@@ -272,8 +272,9 @@ Returns a TOC object:
                 "TVXX0000001" = @{
                     TrilogyFiles = @(...)   # array of file detail objects
                     PSeriesFiles = @(...)
-                    EarliestDate = "2023-03"
-                    LatestDate   = "2025-12"
+                    EarliestDate = "2023-03"   # YYYY-MM when only monthly (AD/DD) files present;
+                                               # YYYY-MM-DD when a daily file extends the range
+                    LatestDate   = "2025-12"   # same format rules as EarliestDate
                     FileCount    = 750
                     Model        = "CA1032800"
                     ProductType  = "0x32"
@@ -287,8 +288,8 @@ Returns a TOC object:
     Devices = @{
         "TVXX0000001" = @{
             BackupPresence = @("12.1.2025", "4.10.2024")
-            OverallEarliest = "2023-03"
-            OverallLatest   = "2025-12"
+            OverallEarliest = "2023-03"   # YYYY-MM or YYYY-MM-DD (same rules as per-backup EarliestDate)
+            OverallLatest   = "2025-12"   # YYYY-MM or YYYY-MM-DD
             TotalUniqueFiles = 800
         }
     }

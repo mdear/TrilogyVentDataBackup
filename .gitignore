@@ -36,3 +36,6 @@ null
 
 # SD card staging folders (e.g. "SD card 26-03-18/")
 /[Ss][Dd] */
+
+# TOC cache (derived, never committed)
+.toc-cache/

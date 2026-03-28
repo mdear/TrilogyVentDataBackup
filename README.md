@@ -95,11 +95,124 @@ Press **Y** and it creates one. That's it — you never need to open this folder
 
 1. Launch the tool
 2. Choose **"Prepare SD Card for Clinician"**
-3. Select which device(s) to include
-4. The tool copies a clean, verified set of files to a location you choose
+3. Choose **Recommended** devices (pre-selected by the tool) or **Custom** to
+   pick specific devices and add an audit note
+4. Optionally enter a **date range** to restrict the data (custom path only)
+5. The tool copies a clean, verified set of files to a location you choose
    (e.g., a blank SD card or USB drive)
 
 The output is compatible with Philips **DirectView** software.
+
+---
+
+## Device Selection for Golden Archives (Wizard)
+
+When building or updating a golden archive via the wizard, you are presented
+with two options:
+
+```
+  R)  Accept recommended selection and proceed
+  C)  Custom selection  —  choose specific devices and add a note
+```
+
+**R — Recommended** accepts the pre-computed device set automatically:
+- First golden: all known devices are included.
+- Update golden: only devices with new or changed data since the last golden.
+
+**C — Custom** lets you manually choose specific devices. You must supply a
+brief **audit note** explaining the reason (it is recorded in the archive
+manifest). You can also optionally apply an inclusive **date range filter** on
+the custom path.
+
+The wizard CLI path (`-Action Golden` / `-Action Prepare`) bypasses this menu
+and accepts `-ForceDevices`, `-ForceReason`, `-FromDate`, and `-ToDate` directly.
+
+---
+
+## TOC Cache
+
+The **Analyze** function builds a Table of Contents (TOC) by scanning every
+backup folder and running integrity checks. On large backup roots this takes
+tens of seconds.
+
+To avoid repeating this work unnecessarily, a fingerprint of the backup folder
+contents (file paths, sizes, and timestamps) is stored in:
+
+```
+{BackupRoot}\.toc-cache\toc.fingerprint
+{BackupRoot}\.toc-cache\toc.clixml
+```
+
+On each subsequent **non-interactive** TOC call (e.g. during Prepare), the
+fingerprint is recomputed and compared. If nothing has changed, the cached TOC
+is loaded from disk in milliseconds instead of being rebuilt.
+
+The cache is **automatically invalidated** when:
+- Any file inside a regular backup folder is added, removed, or modified.
+- The tool forces a rebuild (the Analyze wizard choice always rebuilds).
+
+Changes inside `_golden_*` archive folders do **not** invalidate the cache —
+golden archives are derived from regular backups and do not affect the scan.
+
+---
+
+## Golden Archives in TOC Analysis
+
+The **Analyze** view now includes a **GOLDEN ARCHIVES** section below the
+regular backups table. For each `_golden_*` folder it shows:
+
+- Sequence number and creation date (from `manifest.json`)
+- Active date filter, if one was applied at build time
+- Per-device serial number with data date range and file count
+
+This makes it easy to see at a glance exactly which data is captured in each
+golden archive without opening any files.
+
+---
+
+## Date Range Filter for Golden Archives
+
+When building a golden archive (via **Prepare** or **Golden Archive** in the wizard,
+or via the `-Action Golden` / `-Action Prepare` CLI flags), you can optionally restrict
+which data is included using an **inclusive date range**.
+
+- **What it filters**: EDF therapy-data files (AD_/DD_/WD_) and P-Series per-session
+  (PP) files whose month falls outside the specified range are excluded from all
+  selected devices.  Device identity files (prop.txt, FILES.SEQ, SL_SAPPHIRE.json,
+  etc.) are always included regardless of the date range.
+- **Self-consistency guaranteed**: After filtering, the standard pairing and rewind
+  rules still run, so the resulting golden archive is always internally consistent
+  and passes integrity and content validation.
+- **Manifest recorded**: The `dateFilter` field in `manifest.json` records the
+  `from`/`to` bounds for audit purposes.
+
+### Wizard
+
+After selecting devices, you will be asked:
+
+```
+  From date (inclusive) [blank = no lower bound]: 2024-03-01
+  To date   (inclusive) [blank = no upper bound]: 2025-06-30
+```
+
+Leave **both** blank to include all available data (the default behaviour).
+
+### CLI
+
+Use `-FromDate` and `-ToDate` (both in `YYYY-MM-DD` format):
+
+```powershell
+# Golden only — restrict to data from March 2024 through June 2025
+.\VentBackupManager.ps1 -Action Golden -FromDate '2024-03-01' -ToDate '2025-06-30'
+
+# Prepare (golden + export) — lower bound only
+.\VentBackupManager.ps1 -Action Prepare -Target D:\ -FromDate '2024-06-01'
+
+# No date filter (default) — include everything
+.\VentBackupManager.ps1 -Action Golden
+```
+
+Both flags are optional and independent — you can supply either, both, or neither.
 
 ---
 

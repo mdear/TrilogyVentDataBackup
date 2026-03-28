@@ -4,3 +4,5 @@ settings.json
 # ── Test run artefacts ──
 tests/last-run.log
 tests/last-run.txt
+tests/pester-results.txt
+tests/_readresults.ps1

@@ -22,6 +22,10 @@ param(
     [string[]]$ForceDevices,
     [string]$ForceReason,
 
+    # Date range filter for golden archive (both optional, inclusive, YYYY-MM-DD format)
+    [string]$FromDate,
+    [string]$ToDate,
+
     # Export / Prepare
     [string]$GoldenPath,
     [string]$Target,
@@ -43,6 +47,38 @@ Import-Module (Join-Path $modulesDir 'VBM-Backup.psm1')        -Force
 Import-Module (Join-Path $modulesDir 'VBM-Dedup.psm1')         -Force
 Import-Module (Join-Path $modulesDir 'VBM-UI.psm1')            -Force
 
+# ── Set console window icon ───────────────────────────────────────────────────
+# Uses Win32 LoadImage (LR_LOADFROMFILE) + WM_SETICON to stamp the .ico onto
+# the console window title bar and taskbar button. Runs silently — non-fatal.
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'VBM_WinIcon').Type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class VBM_WinIcon {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll", CharSet=CharSet.Auto, SetLastError=true)]
+    public static extern IntPtr LoadImage(IntPtr hInst, string lpszName, uint uType, int cxDesired, int cyDesired, uint fuLoad);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+}
+'@
+    }
+    $icoFile = Join-Path $PSScriptRoot 'assets\VentBackupManager.ico'
+    if (Test-Path $icoFile) {
+        $hwnd = [VBM_WinIcon]::GetConsoleWindow()
+        if ($hwnd -ne [IntPtr]::Zero) {
+            # IMAGE_ICON = 1, LR_LOADFROMFILE = 0x0010
+            $hIcon = [VBM_WinIcon]::LoadImage([IntPtr]::Zero, $icoFile, 1, 0, 0, 0x0010)
+            if ($hIcon -ne [IntPtr]::Zero) {
+                [VBM_WinIcon]::SendMessage($hwnd, 0x0080, [IntPtr]0, $hIcon) | Out-Null  # ICON_SMALL (title bar)
+                [VBM_WinIcon]::SendMessage($hwnd, 0x0080, [IntPtr]1, $hIcon) | Out-Null  # ICON_BIG  (taskbar/Alt-Tab)
+            }
+        }
+    }
+} catch { <# silently ignore on headless / non-interactive hosts #> }
+
 # ── Helper: resolve BackupRoot ────────────────────────────────────────────────
 function _ResolveBackupRoot {
     param([string]$Given)
@@ -53,20 +89,28 @@ function _ResolveBackupRoot {
 
 # ── Helper: run Analyze ───────────────────────────────────────────────────────
 function _RunAnalyze {
-    param([string]$Root)
+    param(
+        [string]$Root,
+        [switch]$Force   # bypass the TOC cache and always do a full rebuild
+    )
     $Root = _ResolveBackupRoot $Root
     Write-Host "Scanning backup root: $Root" -ForegroundColor Cyan
-    $inv = @(Get-BackupInventory -BackupRoot $Root)
-    if ($inv.Count -eq 0) {
+    # -IncludeGoldens: golden archives are scanned alongside regular backups so that
+    # Show-TOC can render their date ranges in the dedicated GOLDEN ARCHIVES section.
+    $inv = @(Get-BackupInventory -BackupRoot $Root -IncludeGoldens)
+    $regularCount = @($inv | Where-Object { -not $_.IsGolden }).Count
+    if ($regularCount -eq 0) {
         Write-Host "No backup folders found in: $Root" -ForegroundColor Yellow
         return $null
     }
-    Write-Host "Found $($inv.Count) top-level backup(s). Building TOC..."
+    $goldenCount  = @($inv | Where-Object { $_.IsGolden }).Count
+    $goldenNote   = if ($goldenCount -gt 0) { "  ($goldenCount golden archive(s))" } else { '' }
+    Write-Host "Found $regularCount top-level backup(s)$goldenNote. Building TOC..."
     $progress = {
         param([string]$msg, [int]$cur, [int]$tot)
         Write-ProgressBar -Activity $msg -Current $cur -Total $tot
     }
-    $toc = Get-BackupTOC -Inventory $inv -ProgressCallback $progress
+    $toc = Get-CachedBackupTOC -BackupRoot $Root -Inventory $inv -ProgressCallback $progress -Force:$Force
     Write-Host ''   # newline after progress bar
     Show-TOC -TOC $toc
 
@@ -78,28 +122,6 @@ function _RunAnalyze {
         $b = $toc.Backups[$bName]
         if ($b.Integrity -eq 'Contaminated') {
             Write-ContaminationReadme -BackupPath $b.Path -Anomalies $b.Anomalies -TOC $toc
-        }
-    }
-
-    # Show any existing golden archives found in the backup root
-    $goldens = @(Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -match '^_golden_' } |
-                 Where-Object { Test-Path (Join-Path $_.FullName 'manifest.json') } |
-                 Sort-Object Name)
-    if ($goldens.Count -gt 0) {
-        Write-Host ''
-        Write-Host '  Golden archives in this backup root:' -ForegroundColor Cyan
-        foreach ($gDir in $goldens) {
-            $mPath = Join-Path $gDir.FullName 'manifest.json'
-            try {
-                $m       = Get-Content $mPath -Raw | ConvertFrom-Json
-                $seq     = $m.goldenSequence
-                $created = $m.created
-                $devList = ($m.devices.PSObject.Properties.Name) -join ', '
-                Write-Host "    $($gDir.Name)  [seq=$seq  created=$created  devices: $devList]"
-            } catch {
-                Write-Host "    $($gDir.Name)  [manifest unreadable]" -ForegroundColor Yellow
-            }
         }
     }
 
@@ -125,7 +147,9 @@ function _RunPrepare {
         [string]$TargetIn,
         [string[]]$DevicesIn,
         [string[]]$ForceDevicesIn,
-        [string]$ForceReasonIn
+        [string]$ForceReasonIn,
+        [string]$FromDateIn,
+        [string]$ToDateIn
     )
 
     $Root = _ResolveBackupRoot $Root
@@ -139,9 +163,8 @@ function _RunPrepare {
         Write-Host ''
         Write-Host "Existing golden found: $existing" -ForegroundColor Cyan
         # Suggest devices with NEW or CHANGED data since the last golden.
-        # "Changed" means: a new file exists, or a file is larger (better tip), or hash differs.
         $manifest    = Get-Content (Join-Path $existing 'manifest.json') -Raw | ConvertFrom-Json
-        $cleanNames  = @($toc.Backups.Keys | Where-Object { $toc.Backups[$_].Integrity -ne 'Contaminated' })
+        $cleanNames  = @($toc.Backups.Keys | Where-Object { $toc.Backups[$_].Integrity -ne 'Contaminated' -and -not $toc.Backups[$_].IsGolden })
         $changedList = [System.Collections.Generic.List[string]]::new()
         foreach ($sn in $toc.Devices.Keys) {
             $snProp    = $manifest.devices.PSObject.Properties[$sn]
@@ -171,36 +194,39 @@ function _RunPrepare {
         @($toc.Devices.Keys)   # First golden: all devices
     }
 
-    # ── ForceDevices prompt (wizard path only — CLI path supplies params directly) ──
+    # ── Device + date-range selection ────────────────────────────────────────
     $effectiveForceDevices = $ForceDevicesIn
     $effectiveForceReason  = $ForceReasonIn
+    $effectiveFromDate     = $FromDateIn
+    $effectiveToDate       = $ToDateIn
 
-    # In wizard mode (no CLI params given) offer the override prompt
     if ((-not $ForceDevicesIn -or $ForceDevicesIn.Count -eq 0) -and (-not $DevicesIn -or $DevicesIn.Count -eq 0)) {
-        $forceResult = Show-ForceDevicesPrompt -Devices $toc.Devices
-        if ($forceResult.ForceDevices) {
-            $effectiveForceDevices = $forceResult.SelectedSNs
-            $effectiveForceReason  = $forceResult.Reason
+        # Wizard path: unified menu
+        $menuResult = Show-GoldenDeviceMenu -Devices $toc.Devices -Suggested $suggested `
+                          -IsFirstGolden:(-not $existing)
+        $selectedSNs           = $menuResult.SelectedSNs
+        if ($menuResult.IsCustom) {
+            $effectiveForceDevices = $menuResult.SelectedSNs
+            $effectiveForceReason  = $menuResult.Reason
+            $effectiveFromDate     = $menuResult.FromDate
+            $effectiveToDate       = $menuResult.ToDate
         }
-    }
-
-    # Device selection: ForceDevices skips Show-DeviceSelection; otherwise let user confirm
-    $selectedSNs = if ($effectiveForceDevices -and $effectiveForceDevices.Count -gt 0) {
-        $effectiveForceDevices
     } elseif ($DevicesIn -and $DevicesIn.Count -gt 0) {
-        $DevicesIn
+        $selectedSNs = $DevicesIn
     } else {
-        Show-DeviceSelection -Devices $toc.Devices -Suggested $suggested
+        $selectedSNs = $effectiveForceDevices
     }
     if (@($selectedSNs).Count -eq 0) { Write-Host 'No devices selected. Aborting.'; return }
 
     # Build golden
     $goldenOut = if ($existing) {
         Update-GoldenArchive -TOC $toc -GoldenRoot $gRoot -PreviousGolden $existing `
-            -ForceDevices $effectiveForceDevices -ForceReason $effectiveForceReason
+            -ForceDevices $effectiveForceDevices -ForceReason $effectiveForceReason `
+            -FromDate $effectiveFromDate -ToDate $effectiveToDate
     } else {
         New-GoldenArchive -TOC $toc -GoldenRoot $gRoot -Devices $selectedSNs `
-            -ForceDevices $effectiveForceDevices -ForceReason $effectiveForceReason
+            -ForceDevices $effectiveForceDevices -ForceReason $effectiveForceReason `
+            -FromDate $effectiveFromDate -ToDate $effectiveToDate
     }
 
     # Export to target
@@ -260,7 +286,7 @@ function _RunGapAnalysis {
 if ($Action) {
     switch ($Action) {
         'Analyze' {
-            _RunAnalyze -Root $BackupRoot
+            $null = _RunAnalyze -Root $BackupRoot
         }
         'Backup' {
             if (-not $Source) { throw '-Source is required for Backup action.' }
@@ -272,15 +298,17 @@ if ($Action) {
         'Golden' {
             $root  = _ResolveBackupRoot $BackupRoot
             $toc   = _RunAnalyze -Root $root
-            Find-SplitSD -TOC $toc
+            $null = Find-SplitSD -TOC $toc
             $gRoot = if ($GoldenRoot) { $GoldenRoot } else { $root }
             $exist = _FindLatestGolden -Root $gRoot
             if ($exist) {
                 Update-GoldenArchive -TOC $toc -GoldenRoot $gRoot -PreviousGolden $exist `
-                    -ForceDevices $ForceDevices -ForceReason $ForceReason
+                    -ForceDevices $ForceDevices -ForceReason $ForceReason `
+                    -FromDate $FromDate -ToDate $ToDate
             } else {
                 New-GoldenArchive -TOC $toc -GoldenRoot $gRoot -Devices $Devices `
-                    -ForceDevices $ForceDevices -ForceReason $ForceReason
+                    -ForceDevices $ForceDevices -ForceReason $ForceReason `
+                    -FromDate $FromDate -ToDate $ToDate
             }
         }
         'Export' {
@@ -293,7 +321,8 @@ if ($Action) {
         }
         'Prepare' {
             _RunPrepare -Root $BackupRoot -GoldenRootIn $GoldenRoot -TargetIn $Target -DevicesIn $Devices `
-                -ForceDevicesIn $ForceDevices -ForceReasonIn $ForceReason
+                -ForceDevicesIn $ForceDevices -ForceReasonIn $ForceReason `
+                -FromDateIn $FromDate -ToDateIn $ToDate
         }
         'Compact' {
             $root = _ResolveBackupRoot $BackupRoot
@@ -381,8 +410,8 @@ while ($true) {
     try {
         switch ($choice) {
             1 {
-                # Analyze
-                _RunAnalyze -Root $backupRootDefault
+                # Analyze — show fresh table of contents (uses disk cache when unchanged)
+                $null = _RunAnalyze -Root $backupRootDefault
             }
             2 {
                 # Prepare (Golden + Export)
@@ -396,32 +425,61 @@ while ($true) {
                 # Golden Archive only
                 $toc   = _RunAnalyze -Root $backupRootDefault
                 if (-not $toc) { continue }
-                Find-SplitSD -TOC $toc
+                $null = Find-SplitSD -TOC $toc
                 $gRoot = $backupRootDefault
                 $exist = _FindLatestGolden -Root $gRoot
 
-                # Offer ForceDevices override before device selection
-                $wForceDevices = $null
-                $wForceReason  = $null
-                $forceResult   = Show-ForceDevicesPrompt -Devices $toc.Devices
-                if ($forceResult.ForceDevices) {
-                    $wForceDevices = $forceResult.SelectedSNs
-                    $wForceReason  = $forceResult.Reason
+                # Compute suggested device set (same logic as _RunPrepare)
+                $wSuggested = if ($exist) {
+                    $manifest   = Get-Content (Join-Path $exist 'manifest.json') -Raw | ConvertFrom-Json
+                    $cleanNames = @($toc.Backups.Keys | Where-Object { $toc.Backups[$_].Integrity -ne 'Contaminated' -and -not $toc.Backups[$_].IsGolden })
+                    $changed    = [System.Collections.Generic.List[string]]::new()
+                    foreach ($sn in $toc.Devices.Keys) {
+                        $snProp     = $manifest.devices.PSObject.Properties[$sn]
+                        $prevDevice = if ($snProp) { $snProp.Value } else { $null }
+                        if (-not $prevDevice) { $changed.Add($sn); continue }
+                        $bestFiles  = @{}
+                        foreach ($bName in $cleanNames) {
+                            $bkp = $toc.Backups[$bName]
+                            if (-not $bkp.Devices.ContainsKey($sn)) { continue }
+                            foreach ($f in $bkp.Devices[$sn].TrilogyFiles) {
+                                $cur = $bestFiles[$f.FileName]
+                                if (-not $cur -or $f.Size -gt $cur.Size) { $bestFiles[$f.FileName] = $f }
+                            }
+                        }
+                        $hasChange = $false
+                        foreach ($fname in $bestFiles.Keys) {
+                            $hProp    = $prevDevice.fileHashes.PSObject.Properties["Trilogy/$fname"]
+                            $prevHash = if ($hProp) { $hProp.Value } else { $null }
+                            if (-not $prevHash) { $hasChange = $true; break }
+                            $curHash  = (Get-FileHash -Path $bestFiles[$fname].Path -Algorithm MD5).Hash
+                            if ($curHash -ne $prevHash) { $hasChange = $true; break }
+                        }
+                        if ($hasChange) { $changed.Add($sn) }
+                    }
+                    if ($changed.Count -gt 0) { $changed.ToArray() } else { @($toc.Devices.Keys) }
+                } else {
+                    @($toc.Devices.Keys)
                 }
 
-                $snList = if ($wForceDevices -and $wForceDevices.Count -gt 0) {
-                    $wForceDevices
-                } else {
-                    Show-DeviceSelection -Devices $toc.Devices -Suggested @($toc.Devices.Keys)
-                }
+                # Unified device + date-range menu
+                $menuResult    = Show-GoldenDeviceMenu -Devices $toc.Devices -Suggested $wSuggested `
+                                     -IsFirstGolden:(-not $exist)
+                $snList        = $menuResult.SelectedSNs
+                $wForceDevices = if ($menuResult.IsCustom) { $menuResult.SelectedSNs } else { $null }
+                $wForceReason  = if ($menuResult.IsCustom) { $menuResult.Reason      } else { $null }
+                $wFromDate     = $menuResult.FromDate
+                $wToDate       = $menuResult.ToDate
                 if (@($snList).Count -eq 0) { Write-Host 'No devices selected. Aborting.'; continue }
 
                 if ($exist) {
                     Update-GoldenArchive -TOC $toc -GoldenRoot $gRoot -PreviousGolden $exist `
-                        -ForceDevices $wForceDevices -ForceReason $wForceReason
+                        -ForceDevices $wForceDevices -ForceReason $wForceReason `
+                        -FromDate $wFromDate -ToDate $wToDate
                 } else {
                     New-GoldenArchive -TOC $toc -GoldenRoot $gRoot -Devices $snList `
-                        -ForceDevices $wForceDevices -ForceReason $wForceReason
+                        -ForceDevices $wForceDevices -ForceReason $wForceReason `
+                        -FromDate $wFromDate -ToDate $wToDate
                 }
                 # Persist the golden root so Validate can find it even if backup root changes later
                 $_wizGoldenRoot = $gRoot
@@ -437,7 +495,7 @@ while ($true) {
                 Import-SDCard -Source $sdPath -BackupRoot $backupRootDefault
                 Write-Host ''
                 if (Read-YesNo -Prompt 'Run Analyze to see updated table of contents?' -Default $true) {
-                    _RunAnalyze -Root $backupRootDefault
+                    $null = _RunAnalyze -Root $backupRootDefault
                 }
             }
             5 {
@@ -484,6 +542,7 @@ while ($true) {
                 $entries = [System.Collections.Generic.List[hashtable]]::new()
 
                 foreach ($bName in ($toc.Backups.Keys | Sort-Object)) {
+                    if ($toc.Backups[$bName].IsGolden) { continue }  # goldens added by the scan below
                     $status = $toc.Backups[$bName].Integrity
                     $entries.Add(@{ Label = "$bName  ($status)"; Kind = 'backup'; Key = $bName })
                 }

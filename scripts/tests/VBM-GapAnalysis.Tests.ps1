@@ -202,15 +202,16 @@ Describe 'Get-DeviceGaps — contaminated backup handling' {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-Describe 'Get-DeviceGaps — YYYYMM key construction' {
+Describe 'Get-DeviceGaps — YYYY-MM month key output' {
 
-    It 'single-digit months are zero-padded in OverallEarliest' {
+    It 'OverallEarliest and OverallLatest are YYYY-MM strings' {
         $toc = New-SyntheticTOC -SN 'SN001' -MonthKeys @('2023-01')
         $r   = Get-DeviceGaps -TOC $toc -DeviceSerial 'SN001'
         $r.OverallEarliest | Should -Be '2023-01'
+        $r.OverallLatest   | Should -Be '2023-01'
     }
 
-    It 'year rollover is handled correctly (DEC → JAN next year)' {
+    It 'year rollover is handled correctly (DEC → JAN next year) — gap Start/End are YYYY-MM' {
         # Coverage 2023-11, 2024-02 — gap spans 2023-12, 2024-01 (2 months)
         $toc = New-SyntheticTOC -SN 'SN001' -MonthKeys @('2023-11', '2024-02')
         $r   = Get-DeviceGaps -TOC $toc -DeviceSerial 'SN001'

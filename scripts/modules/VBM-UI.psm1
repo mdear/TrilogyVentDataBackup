@@ -631,6 +631,222 @@ function Show-GapSwimLanes {
 
 #endregion
 
+#region ── Show-DateRangePrompt ──────────────────────────────────────────────
+
+function Show-DateRangePrompt {
+    <#
+    .SYNOPSIS
+        Optionally prompt the operator for an inclusive date range to restrict
+        which device data is included in this golden archive build.
+    .DESCRIPTION
+        Both bounds are optional — leaving either blank imposes no restriction on
+        that side.  When no dates are entered, the result HasFilter=$false and
+        the caller should apply no date restriction.
+    .OUTPUTS
+        PSCustomObject:
+          HasFilter  [bool]   — $true if at least one bound was supplied
+          FromDate   [string] — YYYY-MM-DD lower bound, or '' when unrestricted
+          ToDate     [string] — YYYY-MM-DD upper bound, or '' when unrestricted
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host ''
+    Write-Host ('─' * 65)
+    Write-Host '  DATE RANGE FILTER  (optional)' -ForegroundColor Yellow
+    Write-Host ('─' * 65)
+    Write-Host '  Restrict the golden archive to data within an inclusive date'
+    Write-Host '  range across all selected devices.  Data outside the range is'
+    Write-Host '  excluded from every device in this build.'
+    Write-Host ''
+    Write-Host '  Leave both prompts blank to include ALL available data.' -ForegroundColor DarkGray
+    Write-Host '  Format: YYYY-MM-DD  (e.g. 2024-03-01)' -ForegroundColor DarkGray
+    Write-Host ''
+
+    $fromDate = ''
+    while ($true) {
+        $raw = (Read-Host '  From date (inclusive) [blank = no lower bound]').Trim()
+        if ($raw -eq '') { break }
+        if ($raw -match '^\d{4}-\d{2}-\d{2}$') {
+            $__dt = [datetime]::MinValue
+            if ([datetime]::TryParse($raw, [ref]$__dt)) { $fromDate = $raw; break }
+        }
+        Write-Host '  Invalid format — use YYYY-MM-DD (e.g. 2024-03-01).' -ForegroundColor Yellow
+    }
+
+    $toDate = ''
+    while ($true) {
+        $raw = (Read-Host '  To date   (inclusive) [blank = no upper bound]').Trim()
+        if ($raw -eq '') { break }
+        if ($raw -match '^\d{4}-\d{2}-\d{2}$') {
+            $__dt = [datetime]::MinValue
+            if ([datetime]::TryParse($raw, [ref]$__dt)) {
+                if ($fromDate -and $raw -lt $fromDate) {
+                    Write-Host "  To date '$raw' is before From date '$fromDate' — please re-enter." -ForegroundColor Yellow
+                    continue
+                }
+                $toDate = $raw; break
+            }
+        }
+        Write-Host '  Invalid format — use YYYY-MM-DD (e.g. 2024-03-01).' -ForegroundColor Yellow
+    }
+
+    $hasFilter = ($fromDate -ne '' -or $toDate -ne '')
+    if ($hasFilter) {
+        $fromDisp = if ($fromDate) { $fromDate } else { 'any' }
+        $toDisp   = if ($toDate  ) { $toDate   } else { 'any' }
+        Write-Host ''
+        Write-Host "  Date filter: $fromDisp → $toDisp" -ForegroundColor Cyan
+        Write-Host '  Data outside this range will be excluded from the golden archive.' -ForegroundColor DarkGray
+    } else {
+        Write-Host '  No date filter — all available data will be included.' -ForegroundColor DarkGray
+    }
+    Write-Host ''
+
+    return [PSCustomObject]@{
+        HasFilter = $hasFilter
+        FromDate  = $fromDate
+        ToDate    = $toDate
+    }
+}
+
+#endregion
+
+#region ── Show-GoldenDeviceMenu ─────────────────────────────────────────────
+
+function Show-GoldenDeviceMenu {
+    <#
+    .SYNOPSIS
+        Unified device-selection entry point for the golden archive wizard flow.
+    .DESCRIPTION
+        Presents two clear paths to the operator:
+          R)  Recommended — accept the pre-computed suggested device set and proceed.
+          C)  Custom      — manually choose devices, enter a brief audit note, and
+                           optionally apply an inclusive date-range filter.
+
+        This replaces the former two-step Show-ForceDevicesPrompt +
+        Show-DeviceSelection + Show-DateRangePrompt sequence with a single,
+        professional interaction.
+    .PARAMETER Devices
+        Hashtable or PSCustomObject of SN -> device summary from TOC.Devices.
+    .PARAMETER Suggested
+        Array of SNs pre-selected as the recommended set (all devices for a first
+        golden; devices with changed data for an update golden).
+    .PARAMETER IsFirstGolden
+        When $true the recommendation header reads "first golden — all devices".
+        When $false it reads "devices with updated data since last golden".
+    .OUTPUTS
+        PSCustomObject:
+          SelectedSNs  [string[]]  — SNs chosen for this golden run
+          IsCustom     [bool]      — $true when the user chose the Custom path
+          Reason       [string]    — audit note (empty string on Recommended path)
+          FromDate     [string]    — YYYY-MM-DD lower bound, or '' (Custom path only)
+          ToDate       [string]    — YYYY-MM-DD upper bound, or '' (Custom path only)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Devices,
+        [string[]]$Suggested,
+        [switch]$IsFirstGolden
+    )
+
+    $snList = if ($Devices -is [hashtable]) {
+        @($Devices.Keys | Sort-Object)
+    } else {
+        @($Devices.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+    }
+
+    if (-not $Suggested -or $Suggested.Count -eq 0) { $Suggested = $snList }
+
+    $recommendLabel = if ($IsFirstGolden) {
+        "All $($snList.Count) device(s)  —  first golden, no prior archive exists"
+    } else {
+        "$($Suggested.Count) of $($snList.Count) device(s) with updated data since last golden"
+    }
+
+    Write-Host ''
+    Write-Host ('─' * 65)
+    Write-Host '  DEVICE SELECTION FOR GOLDEN ARCHIVE' -ForegroundColor Cyan
+    Write-Host ('─' * 65)
+    Write-Host ''
+    Write-Host '  Recommended:' -ForegroundColor White
+    Write-Host "    $recommendLabel" -ForegroundColor DarkGray
+    Write-Host "    SNs: $($Suggested -join ', ')" -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  R)  Accept recommended selection and proceed'
+    Write-Host '  C)  Custom selection  —  choose specific devices and add a note'
+    Write-Host ''
+
+    $pick = ''
+    while ($pick -notin @('R', 'C')) {
+        $pick = (Read-Host '  Your choice [R/C]').Trim().ToUpperInvariant()
+        if ($pick -notin @('R', 'C')) {
+            Write-Host '  Please enter R or C.' -ForegroundColor Yellow
+        }
+    }
+
+    if ($pick -eq 'R') {
+        Write-Host ''
+        Write-Host '  Proceeding with recommended device selection.' -ForegroundColor Green
+        Write-Host ''
+        return [PSCustomObject]@{
+            SelectedSNs = @($Suggested)
+            IsCustom    = $false
+            Reason      = ''
+            FromDate    = ''
+            ToDate      = ''
+        }
+    }
+
+    # ── Custom path ────────────────────────────────────────────────────────
+    Write-Host ''
+    Write-Host '  CUSTOM DEVICE SELECTION' -ForegroundColor Cyan
+    Write-Host '  Choose which devices to include.  Pre-selected ([*]) = recommended.' -ForegroundColor DarkGray
+
+    $selectedSNs = Show-DeviceSelection -Devices $Devices -Suggested $Suggested
+    if (@($selectedSNs).Count -eq 0) {
+        Write-Host '  No devices chosen — reverting to recommended.' -ForegroundColor Yellow
+        $selectedSNs = @($Suggested)
+    }
+
+    # Audit note (required so there is always a record of why a custom selection was made)
+    Write-Host ''
+    Write-Host '  Please enter a brief note explaining this custom selection.' -ForegroundColor DarkGray
+    Write-Host '  It will be recorded in the archive manifest.' -ForegroundColor DarkGray
+    $reason = ''
+    while (-not $reason.Trim()) {
+        $reason = (Read-Host '  Note').Trim()
+        if (-not $reason) {
+            Write-Host '  A note is required. Please enter some text.' -ForegroundColor Yellow
+        }
+    }
+
+    # Optional date range filter
+    $dateResult = Show-DateRangePrompt
+
+    Write-Host ''
+    Write-Host '  ┌─ Custom Selection Summary ─────────────────────────────────┐' -ForegroundColor Cyan
+    Write-Host "  │  Devices : $($selectedSNs -join ', ')" -ForegroundColor Cyan
+    Write-Host "  │  Note    : $reason" -ForegroundColor Cyan
+    if ($dateResult.HasFilter) {
+        $fd = if ($dateResult.FromDate) { $dateResult.FromDate } else { 'any' }
+        $td = if ($dateResult.ToDate  ) { $dateResult.ToDate   } else { 'any' }
+        Write-Host "  │  Filter  : $fd → $td" -ForegroundColor Cyan
+    }
+    Write-Host '  └────────────────────────────────────────────────────────────┘' -ForegroundColor Cyan
+    Write-Host ''
+
+    return [PSCustomObject]@{
+        SelectedSNs = @($selectedSNs)
+        IsCustom    = $true
+        Reason      = $reason
+        FromDate    = $dateResult.FromDate
+        ToDate      = $dateResult.ToDate
+    }
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Show-MainMenu',
     'Show-SourcePicker',
@@ -638,6 +854,8 @@ Export-ModuleMember -Function @(
     'Read-YesNo',
     'Show-DeviceSelection',
     'Show-ForceDevicesPrompt',
+    'Show-DateRangePrompt',
+    'Show-GoldenDeviceMenu',
     'Write-ProgressBar',
     'Write-TimelineChart',
     'Show-GapSwimLanes'

@@ -5,6 +5,40 @@ Import-Module (Join-Path $PSScriptRoot 'VBM-Parsers.psm1') -Force
 
 #region ── Internal helpers ──────────────────────────────────────────────────
 
+# Return the file's date coverage as {Start, End} in YYYY-MM-DD, or $null for
+# file types not date-keyed (BIN, prop.txt, etc.), which always pass the filter.
+function _ExtractFileDateRange {
+    param([string]$FileName)
+    # Monthly EDF (AD/DD): covers the entire calendar month.
+    if ($FileName -match '^(?:AD|DD)_(\d{4})(\d{2})_\d{3}\.edf$') {
+        $y = [int]$Matches[1]; $m = [int]$Matches[2]
+        $last = '{0:D2}' -f [System.DateTime]::DaysInMonth($y, $m)
+        return @{ Start = "$($Matches[1])-$($Matches[2])-01"; End = "$($Matches[1])-$($Matches[2])-$last" }
+    }
+    # Daily EDF (WD): exact-day precision.
+    if ($FileName -match '^WD_(\d{4})(\d{2})(\d{2})_\d{3}\.edf$') {
+        $ds = "$($Matches[1])-$($Matches[2])-$($Matches[3])"
+        return @{ Start = $ds; End = $ds }
+    }
+    # EL CSV: exact-day precision.
+    if ($FileName -match '^EL_[^_]+_(\d{4})(\d{2})(\d{2})\.csv$') {
+        $ds = "$($Matches[1])-$($Matches[2])-$($Matches[3])"
+        return @{ Start = $ds; End = $ds }
+    }
+    return $null
+}
+
+# Return $true if the file's date range overlaps [FromDate, ToDate] (YYYY-MM-DD strings).
+# $FileRange is @{Start; End} or $null (non-date-keyed → always pass).
+# An empty bound means unrestricted on that side.
+function _IsFileInDateRange {
+    param($FileRange, [string]$FromDate, [string]$ToDate)
+    if (-not $FileRange)                               { return $true  }
+    if ($FromDate -and $FileRange.End   -lt $FromDate) { return $false }
+    if ($ToDate   -and $FileRange.Start -gt $ToDate  ) { return $false }
+    return $true
+}
+
 # Sort backup names to determine chronological order by latest device data date.
 # Returns backup names sorted oldest-first.
 function _SortBackupsByDate {
@@ -27,7 +61,10 @@ function _GatherTrilogyFiles {
         # Contaminated backups to mine for files unambiguously attributable to DeviceSN
         # via their embedded EDF header SN.  Non-EDF files are never salvaged from here.
         [string[]]$ContaminatedBackupNames = @(),
-        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new())
+        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new()),
+        # Optional inclusive date range (YYYY-MM-DD). Files outside the range are excluded.
+        [string]$FromDate,
+        [string]$ToDate
     )
     $groups = @{}  # filename -> best-so-far {Path, Size, SN, BackupName, Salvaged}
 
@@ -36,6 +73,8 @@ function _GatherTrilogyFiles {
         $b = $Backups[$bName]
         if (-not $b.Devices.ContainsKey($DeviceSN)) { continue }
         foreach ($f in $b.Devices[$DeviceSN].TrilogyFiles) {
+            # Date range filter
+            if (-not (_IsFileInDateRange (_ExtractFileDateRange $f.FileName) $FromDate $ToDate)) { continue }
             # Edge case 14: verify the file belongs to the right device via EDF header
             if ($f.FileName -match '\.edf$') {
                 $headerSN = Get-EdfDeviceSerial -Path $f.Path
@@ -65,6 +104,8 @@ function _GatherTrilogyFiles {
         foreach ($snKey in $b.Devices.Keys) {
             foreach ($f in $b.Devices[$snKey].TrilogyFiles) {
                 if ($f.FileName -notmatch '\.edf$') { continue }  # EDF only — strict header check required
+                # Date range filter (applied before the expensive header read)
+                if (-not (_IsFileInDateRange (_ExtractFileDateRange $f.FileName) $FromDate $ToDate)) { continue }
                 $headerSN = Get-EdfDeviceSerial -Path $f.Path
                 if ($headerSN -ne $DeviceSN) { continue }  # Must affirmatively match (not just not-wrong)
                 $cur = $groups[$f.FileName]
@@ -98,7 +139,11 @@ function _GatherPSeriesFiles {
         [string]$DeviceSN,
         [string[]]$SortedCleanNames,
         [string[]]$ContaminatedBackupNames = @(),
-        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new())
+        [ref]$SalvageLog = [ref]([System.Collections.Generic.List[PSCustomObject]]::new()),
+        # Optional inclusive date range (YYYY-MM-DD). PP ring-buffer entries outside the
+        # range are excluded.  Steering files (prop.txt etc.) are never date-filtered.
+        [string]$FromDate,
+        [string]$ToDate
     )
     $steeringNames = @('prop.txt','FILES.SEQ','TRANSMITFILE.SEQ','SL_SAPPHIRE.json')
     $steering      = @{}   # FileName -> {Path, Size}
@@ -123,6 +168,11 @@ function _GatherPSeriesFiles {
                 # Strip leading "P-Series\{SN}\" from $rel to get a key relative to the device dir.
                 # Use ^ anchor because $rel never has a leading slash (it is built with TrimStart).
                 $ringKey = ($rel -replace '^P-Series[/\\][^/\\]+[/\\]', '') -replace '\\', '/'
+                # Date range filter — PP entries have exact-day precision via filename (P3/PP_YYYYMMDD_NNN.json)
+                if ($ringKey -match '/PP_(\d{4})(\d{2})(\d{2})_') {
+                    $ppRange = @{ Start = "$($Matches[1])-$($Matches[2])-$($Matches[3])"; End = "$($Matches[1])-$($Matches[2])-$($Matches[3])" }
+                    if (-not (_IsFileInDateRange $ppRange $FromDate $ToDate)) { continue }
+                }
                 $cur = $ringBuf[$ringKey]
                 if (-not $cur -or $pf.Size -gt $cur.Size) {
                     $ringBuf[$ringKey] = [PSCustomObject]@{
@@ -171,6 +221,11 @@ function _GatherPSeriesFiles {
             $isRing = $rel -match '[/\\]P[0-7][/\\]'
             if ($isRing) {
                 $ringKey = ($rel -replace '^P-Series[/\\][^/\\]+[/\\]', '') -replace '\\', '/'
+                # Date range filter for contaminated salvage path
+                if ($ringKey -match '/PP_(\d{4})(\d{2})(\d{2})_') {
+                    $ppRange = @{ Start = "$($Matches[1])-$($Matches[2])-$($Matches[3])"; End = "$($Matches[1])-$($Matches[2])-$($Matches[3])" }
+                    if (-not (_IsFileInDateRange $ppRange $FromDate $ToDate)) { continue }
+                }
                 $cur = $ringBuf[$ringKey]
                 if (-not $cur -or $pf.Size -gt $cur.Size) {
                     $ringBuf[$ringKey] = [PSCustomObject]@{
@@ -494,7 +549,10 @@ function _BuildDeviceGolden {
         [hashtable]$Backups,
         [string]$GoldenPath,
         [string[]]$CleanBackupNames,
-        [string[]]$ContaminatedBackupNames = @()
+        [string[]]$ContaminatedBackupNames = @(),
+        # Optional date range filter (YYYY-MM-DD strings). Passed through to _Gather* functions.
+        [string]$FromDate,
+        [string]$ToDate
     )
     # Sort backups oldest-first so ring buffer key collisions prefer newer data
     $sortedNames = _SortBackupsByDate -Backups $Backups -DeviceSN $DeviceSN
@@ -504,7 +562,8 @@ function _BuildDeviceGolden {
     $rawTriGroups = _GatherTrilogyFiles -Backups $Backups -DeviceSN $DeviceSN `
         -CleanBackupNames $CleanBackupNames `
         -ContaminatedBackupNames $ContaminatedBackupNames `
-        -SalvageLog ([ref]$rewindLog)
+        -SalvageLog ([ref]$rewindLog) `
+        -FromDate $FromDate -ToDate $ToDate
     $rewindTri    = _RewindTrilogyFiles -TrilogyGroups $rawTriGroups -RewindLog ([ref]$rewindLog)
     $triGroups    = $rewindTri.Files
     $trilogyDst   = Join-Path $GoldenPath "$DeviceSN\Trilogy"
@@ -523,7 +582,8 @@ function _BuildDeviceGolden {
     $rawPsData = _GatherPSeriesFiles -Backups $Backups -DeviceSN $DeviceSN `
         -SortedCleanNames $sortedNames `
         -ContaminatedBackupNames $ContaminatedBackupNames `
-        -SalvageLog ([ref]$rewindLog)
+        -SalvageLog ([ref]$rewindLog) `
+        -FromDate $FromDate -ToDate $ToDate
     $psData    = _RewindPSeriesFiles `
         -Steering $rawPsData.Steering `
         -RingBuf  $rawPsData.RingBuf `
@@ -623,6 +683,13 @@ function New-GoldenArchive {
         Must be combined with -ForceReason for audit trail.
     .PARAMETER ForceReason
         Free-text reason recorded in manifest.json when -ForceDevices is supplied.
+    .PARAMETER FromDate
+        Optional start of inclusive date range (YYYY-MM-DD, e.g. '2024-03-01'). When specified,
+        only EDF files and PP ring-buffer entries at or after this date are included.
+        Use together with -ToDate to define a window; omit for no restriction.
+    .PARAMETER ToDate
+        Optional end of inclusive date range (YYYY-MM-DD, e.g. '2025-06-30'). When specified,
+        only EDF files and PP ring-buffer entries at or before this date are included.
     #>
     [CmdletBinding()]
     param(
@@ -630,7 +697,9 @@ function New-GoldenArchive {
         [Parameter(Mandatory)][string]$GoldenRoot,
         [string[]]$Devices,
         [string[]]$ForceDevices,
-        [string]$ForceReason
+        [string]$ForceReason,
+        [string]$FromDate,
+        [string]$ToDate
     )
 
     $date       = Get-Date -Format 'yyyy-MM-dd'
@@ -643,8 +712,31 @@ function New-GoldenArchive {
     }
     $null = New-Item -ItemType Directory -Path $goldenPath -Force
 
-    $cleanNames      = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
-    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' })
+    # Validate optional date range filter
+    if ($FromDate -and $FromDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        throw "-FromDate '$FromDate' must be in YYYY-MM-DD format (e.g. '2024-03-01')"
+    }
+    if ($ToDate -and $ToDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        throw "-ToDate '$ToDate' must be in YYYY-MM-DD format (e.g. '2024-03-01')"
+    }
+    $__dtFrom = [datetime]::MinValue
+    if ($FromDate -and -not [datetime]::TryParse($FromDate, [ref]$__dtFrom)) {
+        throw "-FromDate '$FromDate' is not a valid calendar date"
+    }
+    $__dtTo = [datetime]::MinValue
+    if ($ToDate -and -not [datetime]::TryParse($ToDate, [ref]$__dtTo)) {
+        throw "-ToDate '$ToDate' is not a valid calendar date"
+    }
+    if ($FromDate -and $ToDate -and $ToDate -lt $FromDate) {
+        throw "-ToDate '$ToDate' must not be before -FromDate '$FromDate'"
+    }
+    if ($FromDate -or $ToDate) {
+        $fromDisp = if ($FromDate) { $FromDate } else { 'any' }
+        $toDisp   = if ($ToDate)   { $ToDate   } else { 'any' }
+        Write-Host "  Date filter active: $fromDisp → $toDisp (data outside this range excluded)" -ForegroundColor Yellow
+    }
+    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' -and -not $TOC.Backups[$_].IsGolden })
+    $cleanNames        = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' -and -not $TOC.Backups[$_].IsGolden })
 
     # ForceDevices takes precedence over Devices and the algorithm's default
     $targetSNs = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
@@ -667,7 +759,8 @@ function New-GoldenArchive {
     foreach ($sn in $targetSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
         $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
-            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames
+            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames `
+            -FromDate $FromDate -ToDate $ToDate
 
         # Propagate SplitSD annotation from TOC (set by Find-SplitSD if called beforehand)
         $tocDev = if ($TOC.Devices.ContainsKey($sn)) { $TOC.Devices[$sn] } else { $null }
@@ -708,6 +801,10 @@ function New-GoldenArchive {
         backupRoot          = (Split-Path $goldenPath -Parent)
         forcedDevicesReason = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
             if ($ForceReason) { $ForceReason } else { 'Devices forced by operator (no reason provided)' }
+        } else { $null }
+        dateFilter          = if ($FromDate -or $ToDate) {
+            @{ from = if ($FromDate) { $FromDate } else { $null }
+               to   = if ($ToDate  ) { $ToDate   } else { $null } }
         } else { $null }
         devices             = $manifestDevices
     }
@@ -760,6 +857,12 @@ function Update-GoldenArchive {
         Override: include exactly these SNs regardless of change detection.
     .PARAMETER ForceReason
         Free-text reason recorded in manifest.json when -ForceDevices is supplied.
+    .PARAMETER FromDate
+        Optional start of inclusive date range (YYYY-MM-DD). Only data at or after this
+        date is included in the golden. Omit for no lower bound.
+    .PARAMETER ToDate
+        Optional end of inclusive date range (YYYY-MM-DD). Only data at or before this
+        date is included in the golden. Omit for no upper bound.
     #>
     [CmdletBinding()]
     param(
@@ -767,7 +870,9 @@ function Update-GoldenArchive {
         [Parameter(Mandatory)][string]$GoldenRoot,
         [Parameter(Mandatory)][string]$PreviousGolden,
         [string[]]$ForceDevices,
-        [string]$ForceReason
+        [string]$ForceReason,
+        [string]$FromDate,
+        [string]$ToDate
     )
 
     $prevManifestPath = Join-Path $PreviousGolden 'manifest.json'
@@ -777,8 +882,8 @@ function Update-GoldenArchive {
     $prevManifest = Get-Content $prevManifestPath -Raw | ConvertFrom-Json
 
     # Determine which devices have changed vs previous golden
-    $cleanNames        = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' })
-    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' })
+    $cleanNames        = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -ne 'Contaminated' -and -not $TOC.Backups[$_].IsGolden })
+    $contaminatedNames = @($TOC.Backups.Keys | Where-Object { $TOC.Backups[$_].Integrity -eq 'Contaminated' -and -not $TOC.Backups[$_].IsGolden })
     $changedSNs   = [System.Collections.Generic.List[string]]::new()
 
     if ($ForceDevices -and $ForceDevices.Count -gt 0) {
@@ -836,12 +941,37 @@ function Update-GoldenArchive {
     }
     $null = New-Item -ItemType Directory -Path $goldenPath -Force
 
+    # Validate optional date range filter
+    if ($FromDate -and $FromDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        throw "-FromDate '$FromDate' must be in YYYY-MM-DD format (e.g. '2024-03-01')"
+    }
+    if ($ToDate -and $ToDate -notmatch '^\d{4}-\d{2}-\d{2}$') {
+        throw "-ToDate '$ToDate' must be in YYYY-MM-DD format (e.g. '2024-03-01')"
+    }
+    $__dtFrom = [datetime]::MinValue
+    if ($FromDate -and -not [datetime]::TryParse($FromDate, [ref]$__dtFrom)) {
+        throw "-FromDate '$FromDate' is not a valid calendar date"
+    }
+    $__dtTo = [datetime]::MinValue
+    if ($ToDate -and -not [datetime]::TryParse($ToDate, [ref]$__dtTo)) {
+        throw "-ToDate '$ToDate' is not a valid calendar date"
+    }
+    if ($FromDate -and $ToDate -and $ToDate -lt $FromDate) {
+        throw "-ToDate '$ToDate' must not be before -FromDate '$FromDate'"
+    }
+    if ($FromDate -or $ToDate) {
+        $fromDisp = if ($FromDate) { $FromDate } else { 'any' }
+        $toDisp   = if ($ToDate)   { $ToDate   } else { 'any' }
+        Write-Host "  Date filter active: $fromDisp → $toDisp (data outside this range excluded)" -ForegroundColor Yellow
+    }
+
     $nextSeq = [int]$prevManifest.goldenSequence + 1
     $manifestDevices = @{}
     foreach ($sn in $changedSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
         $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
-            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames
+            -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames `
+            -FromDate $FromDate -ToDate $ToDate
 
         $tocDev = if ($TOC.Devices.ContainsKey($sn)) { $TOC.Devices[$sn] } else { $null }
         $splitSD    = $tocDev -and $tocDev.PSObject.Properties['SplitSD'] -and $tocDev.SplitSD
@@ -881,6 +1011,10 @@ function Update-GoldenArchive {
         backupRoot          = (Split-Path $goldenPath -Parent)
         forcedDevicesReason = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
             if ($ForceReason) { $ForceReason } else { 'Devices forced by operator (no reason provided)' }
+        } else { $null }
+        dateFilter          = if ($FromDate -or $ToDate) {
+            @{ from = if ($FromDate) { $FromDate } else { $null }
+               to   = if ($ToDate  ) { $ToDate   } else { $null } }
         } else { $null }
         devices             = $manifestDevices
     }
@@ -1371,14 +1505,155 @@ function Test-GoldenContent {
 function _WriteGoldenReadme {
     param([string]$GoldenPath, [string[]]$Devices, [int]$Sequence)
 
+    # Load manifest to get per-device statistics already computed during build
+    $manifest = $null
+    $manifestPath = Join-Path $GoldenPath 'manifest.json'
+    if (Test-Path $manifestPath) {
+        try { $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+    }
+
+    # Helper: derive covered months and gaps from EDF filenames in the golden's Trilogy folder
+    function _GoldenDeviceStats {
+        param([string]$DevicePath)
+        $triPath = Join-Path $DevicePath 'Trilogy'
+        $covered = [System.Collections.Generic.SortedSet[string]]::new()
+        if (Test-Path $triPath) {
+            foreach ($f in Get-ChildItem -LiteralPath $triPath -Filter '*.edf' -File -ErrorAction SilentlyContinue) {
+                if ($f.Name -match '^(?:AD|DD)_(\d{4})(\d{2})_\d{3}\.edf$') {
+                    [void]$covered.Add("$($Matches[1])-$($Matches[2])")
+                }
+            }
+        }
+        if ($covered.Count -eq 0) { return @{ Covered = @(); Gaps = @() } }
+
+        # Build gap list between first and last covered month
+        $sorted = @($covered)
+        $sy = [int]$sorted[0].Substring(0,4); $sm = [int]$sorted[0].Substring(5,2)
+        $ey = [int]$sorted[-1].Substring(0,4); $em = [int]$sorted[-1].Substring(5,2)
+        $gaps    = [System.Collections.Generic.List[string]]::new()
+        $cy = $sy; $cm = $sm
+        while (($cy * 12 + $cm) -le ($ey * 12 + $em)) {
+            $key = "$cy-$(([string]$cm).PadLeft(2,'0'))"
+            if (-not $covered.Contains($key)) { $gaps.Add($key) }
+            $cm++; if ($cm -gt 12) { $cm = 1; $cy++ }
+        }
+        return @{ Covered = $sorted; Gaps = $gaps.ToArray() }
+    }
+
+    # Helper: format a device therapy date range for markdown output.
+    # Dates may be YYYY-MM (month-granularity from AD/DD files) or YYYY-MM-DD
+    # (day-granularity when daily files extend beyond the monthly range).
+    # No day values are fabricated — strings are emitted exactly as stored.
+    function _FmtRange {
+        param([string]$Earliest, [string]$Latest)
+        if (-not $Earliest -and -not $Latest) { return 'unknown' }
+        $from = if ($Earliest) { $Earliest } else { '?' }
+        $to   = if ($Latest)   { $Latest   } else { '?' }
+        if ($from -eq $to) { return $from }
+        return "$from to $to"
+    }
+
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine("# Golden Archive — Sequence $Sequence")
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('> **Auto-generated by VentBackupManager** — verified, per-device data.')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine("**Created**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  ")
-    [void]$sb.AppendLine("**Devices included**: $($Devices -join ', ')")
+    [void]$sb.AppendLine("**Devices included**: $($Devices -join ', ')  ")
+    if ($manifest -and $manifest.dateFilter -and
+        ($manifest.dateFilter.from -or $manifest.dateFilter.to)) {
+        $fromDisp = if ($manifest.dateFilter.from) { $manifest.dateFilter.from } else { 'any' }
+        $toDisp   = if ($manifest.dateFilter.to)   { $manifest.dateFilter.to   } else { 'any' }
+        [void]$sb.AppendLine("**Date filter applied**: $fromDisp → $toDisp  ")
+    }
+    if ($manifest -and $manifest.forcedDevicesReason) {
+        [void]$sb.AppendLine("**Audit note**: $($manifest.forcedDevicesReason)  ")
+    }
     [void]$sb.AppendLine('')
+
+    # ── Per-device data summary ──────────────────────────────────────────────
+    [void]$sb.AppendLine('## Data Summary')
+    [void]$sb.AppendLine('')
+    foreach ($sn in $Devices) {
+        [void]$sb.AppendLine("### $sn")
+        $devPath = Join-Path $GoldenPath $sn
+
+        # Manifest-sourced metadata (model, firmware, file counts, date ranges)
+        $mDev = if ($manifest -and $manifest.devices.PSObject.Properties[$sn]) {
+            $manifest.devices.PSObject.Properties[$sn].Value
+        } else { $null }
+
+        if ($mDev) {
+            $model = if ($mDev.model) { $mDev.model } else { 'Trilogy 200' }
+            $fw    = if ($mDev.firmware) { " (firmware $($mDev.firmware))" } else { '' }
+            [void]$sb.AppendLine("**Device**: $model$fw  ")
+
+            # Therapy data (EDF) date range
+            $triRange = $mDev.trilogyDateRange
+            if ($triRange) {
+                $rangeStr = _FmtRange $triRange.Earliest $triRange.Latest
+                [void]$sb.AppendLine("**Therapy data**: $rangeStr  ")
+            }
+
+            # P-Series session range (daily-resolution timestamps)
+            $psRange = $mDev.pSeriesDateRange
+            if ($psRange -and ($psRange.Earliest -or $psRange.Latest)) {
+                $from = if ($psRange.Earliest) { $psRange.Earliest } else { '?' }
+                $to   = if ($psRange.Latest)   { $psRange.Latest   } else { '?' }
+                $psRangeStr = if ($from -eq $to) { $from } else { "$from to $to" }
+                [void]$sb.AppendLine("**Session logs**: $psRangeStr  ")
+            }
+
+            $triCount = if ($mDev.trilogyFileCount) { $mDev.trilogyFileCount } else { 0 }
+            $psCount  = if ($mDev.pSeriesFileCount)  { $mDev.pSeriesFileCount  } else { 0 }
+            [void]$sb.AppendLine("**Files**: $triCount EDF therapy files, $psCount P-Series files  ")
+
+            if ($mDev.splitSD) {
+                [void]$sb.AppendLine("**Note**: Data spans multiple SD cards (split-SD device)  ")
+            }
+        }
+
+        # Month-level coverage and gaps from actual copied EDF files
+        $stats = _GoldenDeviceStats -DevicePath $devPath
+        $covered = $stats.Covered
+        $gaps    = $stats.Gaps
+
+        if ($covered.Count -gt 0) {
+            [void]$sb.AppendLine("**Months covered**: $($covered.Count) ($($covered[0]) – $($covered[-1]))  ")
+            if ($gaps.Count -gt 0) {
+                # Group contiguous gap months into ranges for readability
+                $gapRanges = [System.Collections.Generic.List[string]]::new()
+                $gs = $null; $ge = $null
+                foreach ($gm in $gaps) {
+                    if (-not $gs) { $gs = $gm; $ge = $gm; continue }
+                    # Check if $gm is the month immediately after $ge
+                    $py = [int]$ge.Substring(0,4); $pm = [int]$ge.Substring(5,2)
+                    $pm++; if ($pm -gt 12) { $pm = 1; $py++ }
+                    $next = "$py-$(([string]$pm).PadLeft(2,'0'))"
+                    if ($gm -eq $next) { $ge = $gm } else {
+                        $gapRanges.Add($(if ($gs -eq $ge) { $gs } else { "$gs – $ge" }))
+                        $gs = $gm; $ge = $gm
+                    }
+                }
+                if ($gs) { $gapRanges.Add($(if ($gs -eq $ge) { $gs } else { "$gs – $ge" })) }
+                [void]$sb.AppendLine("**Gaps in data**: $($gapRanges -join ', ')  ")
+            } else {
+                [void]$sb.AppendLine("**Gaps in data**: none — continuous coverage  ")
+            }
+        }
+
+        if ($mDev -and $mDev.rewindLog -and @($mDev.rewindLog).Count -gt 0) {
+            [void]$sb.AppendLine("**Consistency corrections**: $(@($mDev.rewindLog).Count) (see manifest.json for details)  ")
+        }
+
+        if ($mDev -and $mDev.sourceFolders -and @($mDev.sourceFolders).Count -gt 0) {
+            $sfList = ($mDev.sourceFolders | Sort-Object) -join ', '
+            [void]$sb.AppendLine("**Source backups**: $sfList  ")
+        }
+        [void]$sb.AppendLine('')
+    }
+
+    # ── Layout ───────────────────────────────────────────────────────────────
     [void]$sb.AppendLine('## Layout')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('```')

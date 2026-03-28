@@ -940,6 +940,68 @@ Describe 'Update-GoldenArchive — Rewind: rewindLog recorded in updated golden'
 }
 
 # ---------------------------------------------------------------------------
+Describe 'New-GoldenArchive — golden sub-entries excluded from cleanNames' {
+    # Regression test: when the TOC already contains a _golden_* entry (IsGolden=$true),
+    # building a NEW golden must not use the old golden sub-entry as a source backup.
+    # Before the fix, the old golden had Integrity='Golden' which is -ne 'Contaminated',
+    # so it would be included in $cleanNames and its files could pollute the new build.
+
+    BeforeAll {
+        $script:bRootGE = New-TempDir
+        $script:gRootGE = New-TempDir
+        $script:snGE    = 'TV990005001'
+
+        # Create a regular backup
+        New-SyntheticBackup -BackupRoot $script:bRootGE -Name 'bak_ge01' `
+            -DeviceSNs @($script:snGE) -YearMonth '202408'
+
+        # Build an initial golden so the TOC will contain a _golden_* IsGolden entry
+        $inv1 = Get-BackupInventory -BackupRoot $script:bRootGE
+        $toc1 = Get-BackupTOC -Inventory $inv1
+        $script:firstGolden = [string](New-GoldenArchive -TOC $toc1 `
+            -GoldenRoot $script:bRootGE -Devices @($script:snGE))
+
+        # Re-scan — inventory now includes the _golden_* folder
+        $inv2           = Get-BackupInventory -BackupRoot $script:bRootGE -IncludeGoldens
+        $script:toc2    = Get-BackupTOC -Inventory $inv2
+
+        # Add a NEW backup with a fresh month so a second golden is warranted
+        New-SyntheticBackup -BackupRoot $script:bRootGE -Name 'bak_ge02' `
+            -DeviceSNs @($script:snGE) -YearMonth '202409'
+        $inv3           = Get-BackupInventory -BackupRoot $script:bRootGE -IncludeGoldens
+        $script:toc3    = Get-BackupTOC -Inventory $inv3
+    }
+
+    AfterAll {
+        Remove-TempDir $script:bRootGE
+        Remove-TempDir $script:gRootGE
+    }
+
+    It 'TOC precondition: _golden_ entry is tagged IsGolden=true' {
+        $goldenName = [System.IO.Path]::GetFileName($script:firstGolden)
+        $script:toc2.Backups[$goldenName].IsGolden | Should -Be $true
+    }
+
+    It 'building a new golden when TOC has an old golden entry succeeds without error' {
+        # Must not throw even though the TOC includes a golden sub-entry
+        { $null = New-GoldenArchive -TOC $script:toc3 -GoldenRoot $script:gRootGE `
+            -Devices @($script:snGE) } | Should -Not -Throw
+    }
+
+    It 'new golden contains EDF files sourced only from regular backups, not the old golden' {
+        $newGolden = [string](New-GoldenArchive -TOC $script:toc3 -GoldenRoot $script:gRootGE `
+            -Devices @($script:snGE))
+        $manifest  = Get-Content (Join-Path $newGolden 'manifest.json') -Raw | ConvertFrom-Json
+        $srcFolders = @($manifest.devices.$($script:snGE).sourceFolders)
+        # Source folders must all be regular backups (bak_ge01, bak_ge02)
+        # — none should be the old _golden_* folder
+        $goldenName = [System.IO.Path]::GetFileName($script:firstGolden)
+        $srcFolders | Should -Not -Contain $goldenName
+        $srcFolders.Count | Should -BeGreaterThan 0
+    }
+}
+
+# ---------------------------------------------------------------------------
 Describe 'New-GoldenArchive — Salvage from contaminated backup' {
 
     BeforeAll {
