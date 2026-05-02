@@ -593,9 +593,95 @@ while ($true) {
                 }
                 Write-Host ''
                 Write-Host '  [A] All listed above' -ForegroundColor Cyan
+                Write-Host '  [S] Validate SD card / exported media' -ForegroundColor Magenta
                 Write-Host ''
-                $raw = (Read-Host '  Enter number(s) separated by commas, or A for all').Trim().ToUpperInvariant()
+                $raw = (Read-Host '  Enter number(s) separated by commas, A for all, or S for SD card').Trim().ToUpperInvariant()
                 if (-not $raw) { continue }
+
+                if ($raw -eq 'S') {
+                    # ── SD Card / Exported Media Validation ────────────────────────
+                    Write-Host ''
+                    $sdPath = Read-ValidatedPath -Prompt '  Path to SD card or exported folder' -MustExist
+
+                    # Quick sanity check: must contain at least Trilogy/ or P-Series/ somewhere
+                    $hasTri = Test-Path (Join-Path $sdPath 'Trilogy')
+                    $hasPS  = Test-Path (Join-Path $sdPath 'P-Series')
+                    $hasSubDevices = @(Get-ChildItem -LiteralPath $sdPath -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { (Test-Path (Join-Path $_.FullName 'Trilogy')) -or (Test-Path (Join-Path $_.FullName 'P-Series')) }).Count -gt 0
+                    if (-not $hasTri -and -not $hasPS -and -not $hasSubDevices) {
+                        Write-Host "  No recognisable device data found at: $sdPath" -ForegroundColor Red
+                        Write-Host '  (Expected Trilogy/ or P-Series/ directories)' -ForegroundColor Yellow
+                        continue
+                    }
+
+                    Write-Host ''
+                    Write-Host '  ─── SD Card / Export Validation ───' -ForegroundColor Magenta
+                    Write-Host "  Target: $sdPath" -ForegroundColor DarkGray
+                    Write-Host ''
+
+                    # Optional: user can specify a golden path directly
+                    $refGolden = $null
+                    $refChoice = (Read-Host '  Reference golden: [A]uto-discover (default) / [P]ath to golden').Trim().ToUpperInvariant()
+                    if ($refChoice -eq 'P') {
+                        $refGolden = Read-ValidatedPath -Prompt '  Path to reference golden archive' -MustExist
+                    }
+
+                    Write-Host ''
+                    Write-Host '  Computing file hashes on SD card...' -ForegroundColor Cyan
+
+                    $sdResult = Test-SDCardIntegrity -SDCardPath $sdPath `
+                        -ReferenceGoldenPath $refGolden `
+                        -SearchPaths $goldenSearchPaths.ToArray()
+
+                    Write-Host "    Scanned $($sdResult.FileCount) files across $($sdResult.DetectedDevices.Count) device(s)" -ForegroundColor DarkGray
+                    Write-Host "    Layout: $($sdResult.DetectedLayout)" -ForegroundColor DarkGray
+                    Write-Host "    Device(s): $($sdResult.DetectedDevices -join ', ')" -ForegroundColor DarkGray
+                    Write-Host ''
+
+                    if ($sdResult.Passed) {
+                        $refLabel = if ($sdResult.AutoDiscovered) { "$($sdResult.ReferenceGolden) (auto-discovered)" } else { $sdResult.ReferenceGolden }
+                        Write-Host "  Reference golden: $refLabel" -ForegroundColor DarkGray
+                        Write-Host ''
+                        Write-Host '  VERDICT: PASSED — All files match the golden archive.' -ForegroundColor Green
+                        Write-Host '  No tampering detected. Contents are certified authentic.' -ForegroundColor Green
+                    } else {
+                        if ($sdResult.ReferenceGolden) {
+                            $refLabel = if ($sdResult.AutoDiscovered) { "$($sdResult.ReferenceGolden) (auto-discovered)" } else { $sdResult.ReferenceGolden }
+                            Write-Host "  Reference golden: $refLabel" -ForegroundColor DarkGray
+                            Write-Host ''
+                            Write-Host '  VERDICT: FAILED — Differences detected:' -ForegroundColor Red
+                            if ($sdResult.Mismatches.Count -gt 0) {
+                                Write-Host "    Corrupted/altered files: $($sdResult.Mismatches.Count)" -ForegroundColor Red
+                                foreach ($m in $sdResult.Mismatches | Select-Object -First 8) {
+                                    Write-Host "      • $m" -ForegroundColor Red
+                                }
+                                if ($sdResult.Mismatches.Count -gt 8) {
+                                    Write-Host "      ... and $($sdResult.Mismatches.Count - 8) more." -ForegroundColor DarkGray
+                                }
+                            }
+                            if ($sdResult.ExtraOnCard.Count -gt 0) {
+                                Write-Host "    Files on SD card NOT in golden: $($sdResult.ExtraOnCard.Count)" -ForegroundColor Yellow
+                                foreach ($e in $sdResult.ExtraOnCard | Select-Object -First 5) {
+                                    Write-Host "      + $e" -ForegroundColor Yellow
+                                }
+                            }
+                            if ($sdResult.MissingFromCard.Count -gt 0) {
+                                Write-Host "    Files in golden MISSING from SD card: $($sdResult.MissingFromCard.Count)" -ForegroundColor Yellow
+                                foreach ($m in $sdResult.MissingFromCard | Select-Object -First 5) {
+                                    Write-Host "      - $m" -ForegroundColor Yellow
+                                }
+                            }
+                        } else {
+                            Write-Host '  RESULT: No matching golden archive found for comparison.' -ForegroundColor Yellow
+                            foreach ($msg in $sdResult.Mismatches) {
+                                Write-Host "    $msg" -ForegroundColor Yellow
+                            }
+                            Write-Host '  (Specify the golden archive path manually with [P])' -ForegroundColor DarkGray
+                        }
+                    }
+                    Write-Host ''
+                    continue
+                }
 
                 $selectedEntries = if ($raw -eq 'A') {
                     $entries.ToArray()

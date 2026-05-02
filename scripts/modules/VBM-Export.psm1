@@ -217,8 +217,427 @@ function Write-ExportReadme {
 
 #endregion
 
+#region ── Test-SDCardIntegrity ──────────────────────────────────────────────
+
+function Test-SDCardIntegrity {
+    <#
+    .SYNOPSIS
+        Validate an SD card or exported folder for data integrity and tamper detection.
+    .DESCRIPTION
+        Two modes, selected automatically:
+
+        MODE A — Manifest-free (external export / SD card):
+        When the target path does NOT contain a manifest.json (the normal case for
+        SD cards exported via Export-ToTarget, which deliberately omits the manifest
+        to avoid interfering with vendor analysis software):
+          1. Scan files, detect layout (native or multi-device), compute MD5 hashes.
+          2. Auto-discover or manually compare against a local golden archive.
+          3. Deep-diff to report corrupted / added / missing files.
+
+        MODE B — Manifest-present (local golden or path with manifest.json):
+        When the target path DOES contain a manifest.json (e.g. a golden archive on
+        disk, or a folder that was not exported via the standard flow):
+          1. Use the manifest's recorded hashes as ground truth.
+          2. Recompute every file's hash and compare against the manifest.
+          3. Report mismatches — same as Test-GoldenIntegrity but via this unified entry point.
+
+    .PARAMETER SDCardPath
+        Root path of the SD card or exported folder.
+    .PARAMETER ReferenceGoldenPath
+        Optional. Path to a specific golden archive to validate against (Mode A only).
+    .PARAMETER SearchPaths
+        Directories to search when auto-discovering the matching golden archive (Mode A only).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SDCardPath,
+        [string]$ReferenceGoldenPath,
+        [string[]]$SearchPaths
+    )
+
+    # ── Mode B: manifest.json present — validate against embedded hashes ──
+    $localManifestPath = Join-Path $SDCardPath 'manifest.json'
+    if (Test-Path $localManifestPath) {
+        return _ValidateWithManifest -TargetPath $SDCardPath -ManifestPath $localManifestPath
+    }
+
+    # ── Mode A: manifest-free (external export) ───────────────────────────
+    $result = [PSCustomObject]@{
+        Passed             = $false
+        FileCount          = 0
+        ComputedHashes     = @{}       # "SN|relPath" → hash
+        DetectedLayout     = $null     # 'native' or 'multi-device'
+        DetectedDevices    = @()
+        ReferenceGolden    = $null
+        AutoDiscovered     = $false
+        Mismatches         = @()       # files with different hashes
+        ExtraOnCard        = @()       # files on SD not in golden
+        MissingFromCard    = @()       # files in golden not on SD
+    }
+
+    # ── Phase 1: Detect layout and compute hashes ─────────────────────────
+    $layout = _DetectSDLayout -SDCardPath $SDCardPath
+    $result.DetectedLayout  = $layout.Layout
+    $result.DetectedDevices = $layout.Devices
+
+    if ($layout.Devices.Count -eq 0) {
+        $result.Mismatches = @("No recognisable device data found on SD card at: $SDCardPath")
+        return $result
+    }
+
+    $computed = _ComputeSDHashes -SDCardPath $SDCardPath -Layout $layout
+    $result.ComputedHashes = $computed
+    $result.FileCount      = $computed.Count
+
+    # ── Phase 2: Find matching golden ────────────────────────────────────
+    $refPath = $ReferenceGoldenPath
+    if (-not $refPath -and $SearchPaths) {
+        $refPath = Find-MatchingGolden -ComputedHashes $computed -SearchPaths $SearchPaths
+        if ($refPath) { $result.AutoDiscovered = $true }
+    }
+
+    if (-not $refPath) {
+        # Try to find a partial match for deep diff
+        if ($SearchPaths) {
+            $refPath = Find-MatchingGolden -ComputedHashes $computed -SearchPaths $SearchPaths -AllowPartial
+        }
+        if (-not $refPath) {
+            $result.Mismatches = @("No matching golden archive found. Cannot validate.")
+            return $result
+        }
+    }
+
+    $result.ReferenceGolden = $refPath
+
+    # ── Phase 3: Deep comparison against the reference golden ─────────────
+    $refManifestPath = Join-Path $refPath 'manifest.json'
+    if (-not (Test-Path $refManifestPath)) {
+        $result.Mismatches = @("Reference golden manifest.json not found: $refManifestPath")
+        return $result
+    }
+
+    $refManifest = Get-Content $refManifestPath -Raw | ConvertFrom-Json
+
+    # Build reference hash lookup (order-independent)
+    $refLookup = @{}
+    foreach ($snProp in $refManifest.devices.PSObject.Properties) {
+        $sn  = $snProp.Name
+        $dev = $snProp.Value
+        foreach ($hashProp in $dev.fileHashes.PSObject.Properties) {
+            $refLookup["$sn|$($hashProp.Name)"] = $hashProp.Value
+        }
+    }
+
+    $mismatches      = [System.Collections.Generic.List[string]]::new()
+    $extraOnCard     = [System.Collections.Generic.List[string]]::new()
+    $missingFromCard = [System.Collections.Generic.List[string]]::new()
+
+    # Compare SD → golden
+    foreach ($key in $computed.Keys) {
+        if ($refLookup.ContainsKey($key)) {
+            if ($computed[$key] -ne $refLookup[$key]) {
+                $mismatches.Add("CORRUPTED: $key (computed=$($computed[$key]), golden=$($refLookup[$key]))")
+            }
+        } else {
+            $extraOnCard.Add($key)
+        }
+    }
+    # Compare golden → SD (find missing)
+    foreach ($key in $refLookup.Keys) {
+        if (-not $computed.ContainsKey($key)) {
+            $missingFromCard.Add($key)
+        }
+    }
+
+    $result.Mismatches      = $mismatches.ToArray()
+    $result.ExtraOnCard     = $extraOnCard.ToArray()
+    $result.MissingFromCard = $missingFromCard.ToArray()
+    $result.Passed          = ($mismatches.Count -eq 0 -and $extraOnCard.Count -eq 0 -and $missingFromCard.Count -eq 0)
+
+    return $result
+}
+
+function _DetectSDLayout {
+    <#
+    .SYNOPSIS
+        Detect whether an SD card uses native (single-device) or multi-device layout.
+        Native: Trilogy/ and/or P-Series/ at root.
+        Multi-device: SN-named subdirectories each containing Trilogy/ and/or P-Series/.
+    #>
+    param([string]$SDCardPath)
+
+    # Check for native layout (Trilogy/ or P-Series/ at root)
+    $hasTrilogyAtRoot  = Test-Path (Join-Path $SDCardPath 'Trilogy')
+    $hasPSeriesAtRoot  = Test-Path (Join-Path $SDCardPath 'P-Series')
+
+    if ($hasTrilogyAtRoot -or $hasPSeriesAtRoot) {
+        # Native layout — detect device SN from P-Series/last.txt or EDF headers
+        $devices = [System.Collections.Generic.List[string]]::new()
+        $lastTxt = Join-Path $SDCardPath 'P-Series\last.txt'
+        if (Test-Path $lastTxt) {
+            $sn = (Get-Content $lastTxt -Raw).Trim()
+            if ($sn) { $devices.Add($sn) }
+        }
+        # Fallback: look at P-Series subdirectories that look like serial numbers
+        if ($devices.Count -eq 0) {
+            $psRoot = Join-Path $SDCardPath 'P-Series'
+            if (Test-Path $psRoot) {
+                Get-ChildItem -LiteralPath $psRoot -Directory | Where-Object { $_.Name -match '^TV' } |
+                    ForEach-Object { $devices.Add($_.Name) }
+            }
+        }
+        return [PSCustomObject]@{ Layout = 'native'; Devices = @($devices) }
+    }
+
+    # Multi-device layout — look for subdirectories containing Trilogy/ or P-Series/
+    $devices = [System.Collections.Generic.List[string]]::new()
+    foreach ($dir in Get-ChildItem -LiteralPath $SDCardPath -Directory -ErrorAction SilentlyContinue) {
+        $hasTri = Test-Path (Join-Path $dir.FullName 'Trilogy')
+        $hasPS  = Test-Path (Join-Path $dir.FullName 'P-Series')
+        if ($hasTri -or $hasPS) {
+            $devices.Add($dir.Name)
+        }
+    }
+
+    if ($devices.Count -gt 0) {
+        return [PSCustomObject]@{ Layout = 'multi-device'; Devices = @($devices) }
+    }
+
+    return [PSCustomObject]@{ Layout = $null; Devices = @() }
+}
+
+function _ComputeSDHashes {
+    <#
+    .SYNOPSIS
+        Walk all data files on the SD card and compute MD5 hashes.
+        Returns a hashtable keyed by "SN|relPath" matching the golden manifest format.
+    #>
+    param([string]$SDCardPath, [object]$Layout)
+
+    $hashes = @{}
+
+    if ($Layout.Layout -eq 'native') {
+        $sn = if ($Layout.Devices.Count -gt 0) { $Layout.Devices[0] } else { 'UNKNOWN' }
+
+        # Trilogy files
+        $triDir = Join-Path $SDCardPath 'Trilogy'
+        if (Test-Path $triDir) {
+            foreach ($f in Get-ChildItem -LiteralPath $triDir -File -Recurse) {
+                $rel  = "Trilogy/$($f.Name)"
+                $hash = (Get-FileHash -Path $f.FullName -Algorithm MD5).Hash
+                $hashes["$sn|$rel"] = $hash
+            }
+        }
+
+        # P-Series files — stored as P-Series/{SN}/... in manifest
+        $psRoot = Join-Path $SDCardPath 'P-Series'
+        if (Test-Path $psRoot) {
+            foreach ($snDir in Get-ChildItem -LiteralPath $psRoot -Directory -ErrorAction SilentlyContinue) {
+                foreach ($f in Get-ChildItem -LiteralPath $snDir.FullName -File -Recurse) {
+                    $rel  = $f.FullName.Substring($psRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+                    $hash = (Get-FileHash -Path $f.FullName -Algorithm MD5).Hash
+                    $hashes["$sn|P-Series/$rel"] = $hash
+                }
+            }
+        }
+    } else {
+        # Multi-device layout
+        foreach ($sn in $Layout.Devices) {
+            $snDir = Join-Path $SDCardPath $sn
+
+            # Trilogy files
+            $triDir = Join-Path $snDir 'Trilogy'
+            if (Test-Path $triDir) {
+                foreach ($f in Get-ChildItem -LiteralPath $triDir -File -Recurse) {
+                    $rel  = "Trilogy/$($f.Name)"
+                    $hash = (Get-FileHash -Path $f.FullName -Algorithm MD5).Hash
+                    $hashes["$sn|$rel"] = $hash
+                }
+            }
+
+            # P-Series files
+            $psRoot = Join-Path $snDir 'P-Series'
+            if (Test-Path $psRoot) {
+                foreach ($snSubDir in Get-ChildItem -LiteralPath $psRoot -Directory -ErrorAction SilentlyContinue) {
+                    foreach ($f in Get-ChildItem -LiteralPath $snSubDir.FullName -File -Recurse) {
+                        $rel  = $f.FullName.Substring($psRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+                        $hash = (Get-FileHash -Path $f.FullName -Algorithm MD5).Hash
+                        $hashes["$sn|P-Series/$rel"] = $hash
+                    }
+                }
+            }
+        }
+    }
+
+    return $hashes
+}
+
+function _ValidateWithManifest {
+    <#
+    .SYNOPSIS
+        Validate a folder that contains a manifest.json by recomputing hashes of every
+        listed file and comparing against the manifest's recorded hashes.
+        Used when the target IS a local golden archive (or any path with a manifest).
+    #>
+    param([string]$TargetPath, [string]$ManifestPath)
+
+    $manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+    $isNative = $manifest.PSObject.Properties['nativeLayout'] -and $manifest.nativeLayout
+
+    $failures   = [System.Collections.Generic.List[string]]::new()
+    $fileCount  = 0
+    $deviceList = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($snProp in $manifest.devices.PSObject.Properties) {
+        $sn  = $snProp.Name
+        $dev = $snProp.Value
+        $deviceList.Add($sn)
+
+        foreach ($hashProp in $dev.fileHashes.PSObject.Properties) {
+            $relPath  = $hashProp.Name
+            $expected = $hashProp.Value
+            $fullPath = if ($isNative) { Join-Path $TargetPath $relPath } else { Join-Path $TargetPath "$sn\$relPath" }
+            $fileCount++
+
+            if (-not (Test-Path $fullPath)) {
+                $failures.Add("MISSING: $sn|$relPath (expected at $fullPath)")
+                continue
+            }
+
+            $actual = (Get-FileHash -Path $fullPath -Algorithm MD5).Hash
+            if ($actual -ne $expected) {
+                $failures.Add("CORRUPTED: $sn|$relPath (computed=$actual, manifest=$expected)")
+            }
+        }
+    }
+
+    $layout = if ($isNative) { 'native' } else { 'multi-device' }
+
+    return [PSCustomObject]@{
+        Passed          = ($failures.Count -eq 0)
+        FileCount       = $fileCount
+        ComputedHashes  = @{}
+        DetectedLayout  = $layout
+        DetectedDevices = @($deviceList)
+        ReferenceGolden = $TargetPath       # self-referencing: validated against own manifest
+        AutoDiscovered  = $false
+        Mismatches      = $failures.ToArray()
+        ExtraOnCard     = @()
+        MissingFromCard = @()
+    }
+}
+
+#endregion
+
+#region ── Find-MatchingGolden ──────────────────────────────────────────────
+
+function Find-MatchingGolden {
+    <#
+    .SYNOPSIS
+        Auto-discover which local golden archive matches a set of computed file hashes.
+    .DESCRIPTION
+        Searches the given paths for _golden_* directories and performs order-independent
+        comparison of file-hash sets. Returns the path of the first matching golden, or
+        $null if no match is found.
+    .PARAMETER ComputedHashes
+        Hashtable keyed by "SN|relPath" → MD5 hash (computed from SD card files).
+    .PARAMETER SearchPaths
+        Directories to scan for _golden_* folders.
+    .PARAMETER AllowPartial
+        When set, return the best-matching golden even if not all hashes agree.
+        Used for deep-diff analysis when an exact match isn't found.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$ComputedHashes,
+        [Parameter(Mandatory)][string[]]$SearchPaths,
+        [switch]$AllowPartial
+    )
+
+    # Scan all search paths for golden archives
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($searchPath in $SearchPaths) {
+        if (-not (Test-Path $searchPath)) { continue }
+        $found = @(Get-ChildItem -LiteralPath $searchPath -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^_golden_' } |
+            Where-Object { Test-Path (Join-Path $_.FullName 'manifest.json') })
+        foreach ($item in $found) { $candidates.Add($item.FullName) }
+    }
+
+    # Extract device SNs from the computed hashes for quick filtering
+    $computedSNs = @($ComputedHashes.Keys | ForEach-Object { ($_ -split '\|')[0] } | Sort-Object -Unique)
+
+    $bestMatch      = $null
+    $bestMatchCount = 0
+
+    foreach ($candidatePath in $candidates) {
+        $cManifestPath = Join-Path $candidatePath 'manifest.json'
+        try {
+            $cManifest = Get-Content $cManifestPath -Raw | ConvertFrom-Json
+        } catch { continue }
+
+        # Quick filter: at least one overlapping device SN
+        $cSNs = @($cManifest.devices.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+        $overlap = @($computedSNs | Where-Object { $cSNs -contains $_ })
+        if ($overlap.Count -eq 0) { continue }
+
+        # Build reference lookup from this candidate
+        $refLookup = @{}
+        foreach ($snProp in $cManifest.devices.PSObject.Properties) {
+            $sn  = $snProp.Name
+            $dev = $snProp.Value
+            foreach ($hashProp in $dev.fileHashes.PSObject.Properties) {
+                $refLookup["$sn|$($hashProp.Name)"] = $hashProp.Value
+            }
+        }
+
+        # Order-independent comparison
+        $matchCount = 0
+        $totalKeys  = [Math]::Max($ComputedHashes.Count, $refLookup.Count)
+        $isExact    = $true
+
+        if ($ComputedHashes.Count -ne $refLookup.Count) { $isExact = $false }
+
+        foreach ($key in $ComputedHashes.Keys) {
+            if ($refLookup.ContainsKey($key) -and $ComputedHashes[$key] -eq $refLookup[$key]) {
+                $matchCount++
+            } else {
+                $isExact = $false
+            }
+        }
+        # Check for keys in ref but not in computed
+        if ($isExact) {
+            foreach ($key in $refLookup.Keys) {
+                if (-not $ComputedHashes.ContainsKey($key)) {
+                    $isExact = $false
+                    break
+                }
+            }
+        }
+
+        if ($isExact) {
+            return $candidatePath
+        }
+
+        if ($AllowPartial -and $matchCount -gt $bestMatchCount) {
+            $bestMatchCount = $matchCount
+            $bestMatch      = $candidatePath
+        }
+    }
+
+    if ($AllowPartial -and $bestMatch) {
+        return $bestMatch
+    }
+
+    return $null
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Export-ToTarget',
     'Show-TargetContents',
-    'Write-ExportReadme'
+    'Write-ExportReadme',
+    'Test-SDCardIntegrity',
+    'Find-MatchingGolden'
 )
