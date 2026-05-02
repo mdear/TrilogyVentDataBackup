@@ -48,13 +48,24 @@ function Export-ToTarget {
 
     $isSingle = ($snList.Count -eq 1)
 
+    # Detect native layout from manifest
+    $isNativeGolden = $manifest.PSObject.Properties['nativeLayout'] -and $manifest.nativeLayout
+
+    if (-not $isSingle) {
+        # Multi-device exports produce a per-device subfolder layout that Philips DirectView
+        # cannot read directly.  Emit a prominent warning so the caller is aware.
+        Write-Warning ('DIRECTVIEW INCOMPATIBLE: This multi-device export uses a subfolder layout ' +
+            'that Philips DirectView cannot read directly from the SD card root. ' +
+            'For a DirectView-compatible SD card, export ONE device at a time.')
+    }
+
     if ($isSingle) {
-        _ExportSingleDevice -SN $snList[0] -GoldenPath $GoldenPath -Target $Target
+        _ExportSingleDevice -SN $snList[0] -GoldenPath $GoldenPath -Target $Target -NativeLayout $isNativeGolden
     } else {
         foreach ($sn in $snList) {
             $snTarget = Join-Path $Target $sn
             $null = New-Item -ItemType Directory -Path $snTarget -Force
-            _ExportSingleDevice -SN $sn -GoldenPath $GoldenPath -Target $snTarget
+            _ExportSingleDevice -SN $sn -GoldenPath $GoldenPath -Target $snTarget -NativeLayout $isNativeGolden
         }
         # Root README for multi-device layout
         Write-ExportReadme -Target $Target -Devices ($snList | ForEach-Object {
@@ -69,10 +80,11 @@ function Export-ToTarget {
 }
 
 function _ExportSingleDevice {
-    param([string]$SN, [string]$GoldenPath, [string]$Target)
+    param([string]$SN, [string]$GoldenPath, [string]$Target, [bool]$NativeLayout = $false)
 
     Write-Host "  Exporting $SN ..." -ForegroundColor Cyan
-    $srcBase = Join-Path $GoldenPath $SN
+    # Native layout: files at golden root (no SN subfolder). Multi-device: files under {SN}/.
+    $srcBase = if ($NativeLayout) { $GoldenPath } else { Join-Path $GoldenPath $SN }
 
     # ── Trilogy/ ──────────────────────────────────────────────────────────
     $srcTrilogy = Join-Path $srcBase 'Trilogy'

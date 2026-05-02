@@ -218,6 +218,17 @@ function _RunPrepare {
     }
     if (@($selectedSNs).Count -eq 0) { Write-Host 'No devices selected. Aborting.'; return }
 
+    # Warn when multiple devices are selected — multi-device layout is not readable by
+    # Philips DirectView.  Give the operator a chance to cancel and redo one device at a time.
+    if (@($selectedSNs).Count -gt 1) {
+        if (-not (Show-MultiDeviceDirectViewWarning -DeviceCount @($selectedSNs).Count)) {
+            Write-Host ''
+            Write-Host '  Cancelled. Run Prepare again and select one device at a time to create' -ForegroundColor Yellow
+            Write-Host '  a Philips DirectView-compatible SD card image for each device.' -ForegroundColor Yellow
+            return
+        }
+    }
+
     # Build golden
     $goldenOut = if ($existing) {
         Update-GoldenArchive -TOC $toc -GoldenRoot $gRoot -PreviousGolden $existing `

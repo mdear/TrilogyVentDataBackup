@@ -550,10 +550,15 @@ function _BuildDeviceGolden {
         [string]$GoldenPath,
         [string[]]$CleanBackupNames,
         [string[]]$ContaminatedBackupNames = @(),
+        # When set, device files are written here instead of $GoldenPath\$DeviceSN.
+        # Used for native (single-device) layout where files go at the golden root.
+        [string]$DeviceRoot,
         # Optional date range filter (YYYY-MM-DD strings). Passed through to _Gather* functions.
         [string]$FromDate,
         [string]$ToDate
     )
+    # If DeviceRoot not specified, use the legacy multi-device layout
+    if (-not $DeviceRoot) { $DeviceRoot = Join-Path $GoldenPath $DeviceSN }
     # Sort backups oldest-first so ring buffer key collisions prefer newer data
     $sortedNames = _SortBackupsByDate -Backups $Backups -DeviceSN $DeviceSN
     $rewindLog   = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -566,7 +571,7 @@ function _BuildDeviceGolden {
         -FromDate $FromDate -ToDate $ToDate
     $rewindTri    = _RewindTrilogyFiles -TrilogyGroups $rawTriGroups -RewindLog ([ref]$rewindLog)
     $triGroups    = $rewindTri.Files
-    $trilogyDst   = Join-Path $GoldenPath "$DeviceSN\Trilogy"
+    $trilogyDst   = Join-Path $DeviceRoot 'Trilogy'
 
     $triHashes   = @{}
     $sourceFolderSet = [System.Collections.Generic.HashSet[string]]::new()
@@ -592,7 +597,7 @@ function _BuildDeviceGolden {
         -DeviceSN $DeviceSN `
         -SortedCleanNames $sortedNames `
         -RewindLog ([ref]$rewindLog)
-    $psDst     = Join-Path $GoldenPath "$DeviceSN\P-Series\$DeviceSN"
+    $psDst     = Join-Path $DeviceRoot "P-Series\$DeviceSN"
     $psHashes    = @{}
 
     # Steering files
@@ -615,7 +620,7 @@ function _BuildDeviceGolden {
     }
 
     # last.txt — point to this device
-    $lastTxtDst  = Join-Path $GoldenPath "$DeviceSN\P-Series\last.txt"
+    $lastTxtDst  = Join-Path $DeviceRoot "P-Series\last.txt"
     $null = New-Item -ItemType Directory -Path (Split-Path -Path $lastTxtDst -Parent) -Force -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $lastTxtDst -Value $DeviceSN -Encoding UTF8
 
@@ -755,11 +760,17 @@ function New-GoldenArchive {
         }
     }
 
+    # Determine layout: single device uses native (flat) layout readable by DirectView;
+    # multiple devices use per-SN subfolder layout.
+    $nativeLayout = ($targetSNs.Count -eq 1)
+
     $manifestDevices = @{}
     foreach ($sn in $targetSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
+        $deviceRoot = if ($nativeLayout) { $goldenPath } else { Join-Path $goldenPath $sn }
         $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
             -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames `
+            -DeviceRoot $deviceRoot `
             -FromDate $FromDate -ToDate $ToDate
 
         # Propagate SplitSD annotation from TOC (set by Find-SplitSD if called beforehand)
@@ -799,6 +810,7 @@ function New-GoldenArchive {
         goldenSequence      = 1
         previousGolden      = $null
         backupRoot          = (Split-Path $goldenPath -Parent)
+        nativeLayout        = $nativeLayout
         forcedDevicesReason = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
             if ($ForceReason) { $ForceReason } else { 'Devices forced by operator (no reason provided)' }
         } else { $null }
@@ -810,8 +822,10 @@ function New-GoldenArchive {
     }
     _WriteManifest -GoldenPath $goldenPath -ManifestData $manifest
 
-    # README for the golden archive
-    _WriteGoldenReadme -GoldenPath $goldenPath -Devices $targetSNs -Sequence 1
+    # README for the golden archive (only for multi-device layout; native layout omits it)
+    if (-not $nativeLayout) {
+        _WriteGoldenReadme -GoldenPath $goldenPath -Devices $targetSNs -Sequence 1
+    }
 
     Write-Host ''
     Write-Host "Golden archive created: $goldenPath" -ForegroundColor Green
@@ -966,11 +980,17 @@ function Update-GoldenArchive {
     }
 
     $nextSeq = [int]$prevManifest.goldenSequence + 1
+    # Determine layout: single device uses native (flat) layout readable by DirectView;
+    # multiple devices use per-SN subfolder layout.
+    $nativeLayout = ($changedSNs.Count -eq 1)
+
     $manifestDevices = @{}
     foreach ($sn in $changedSNs) {
         Write-Host "  Building golden for $sn ..." -ForegroundColor Cyan
+        $deviceRoot = if ($nativeLayout) { $goldenPath } else { Join-Path $goldenPath $sn }
         $devResult = _BuildDeviceGolden -DeviceSN $sn -Backups $TOC.Backups -GoldenPath $goldenPath `
             -CleanBackupNames $cleanNames -ContaminatedBackupNames $contaminatedNames `
+            -DeviceRoot $deviceRoot `
             -FromDate $FromDate -ToDate $ToDate
 
         $tocDev = if ($TOC.Devices.ContainsKey($sn)) { $TOC.Devices[$sn] } else { $null }
@@ -1009,6 +1029,7 @@ function Update-GoldenArchive {
         goldenSequence      = $nextSeq
         previousGolden      = $PreviousGolden
         backupRoot          = (Split-Path $goldenPath -Parent)
+        nativeLayout        = $nativeLayout
         forcedDevicesReason = if ($ForceDevices -and $ForceDevices.Count -gt 0) {
             if ($ForceReason) { $ForceReason } else { 'Devices forced by operator (no reason provided)' }
         } else { $null }
@@ -1019,7 +1040,9 @@ function Update-GoldenArchive {
         devices             = $manifestDevices
     }
     _WriteManifest -GoldenPath $goldenPath -ManifestData $manifest
-    _WriteGoldenReadme -GoldenPath $goldenPath -Devices $changedSNs -Sequence $nextSeq
+    if (-not $nativeLayout) {
+        _WriteGoldenReadme -GoldenPath $goldenPath -Devices $changedSNs -Sequence $nextSeq
+    }
 
     Write-Host ''
     Write-Host "Golden archive created: $goldenPath" -ForegroundColor Green
@@ -1074,6 +1097,9 @@ function Test-GoldenIntegrity {
     $failures  = [System.Collections.Generic.List[string]]::new()
     $fileCount = 0
 
+    # Native layout: files at golden root (no SN subfolder). Multi-device: files under {SN}/.
+    $isNative = $manifest.PSObject.Properties['nativeLayout'] -and $manifest.nativeLayout
+
     foreach ($snProp in $manifest.devices.PSObject.Properties) {
         $sn  = $snProp.Name
         $dev = $snProp.Value
@@ -1081,7 +1107,7 @@ function Test-GoldenIntegrity {
         foreach ($hashProp in $dev.fileHashes.PSObject.Properties) {
             $relPath  = $hashProp.Name                        # e.g. "Trilogy/AD_202303_000.edf"
             $expected = $hashProp.Value
-            $fullPath = Join-Path $GoldenPath "$sn\$relPath"
+            $fullPath = if ($isNative) { Join-Path $GoldenPath $relPath } else { Join-Path $GoldenPath "$sn\$relPath" }
             $fileCount++
 
             if (-not (Test-Path $fullPath)) {
@@ -1201,20 +1227,25 @@ function Test-GoldenContent {
         }
     }
 
-    # Orphan device folders (on disk but absent from manifest)
-    $onDiskSNs = @(Get-ChildItem -LiteralPath $GoldenPath -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch '^_' -and $_.Name -ne 'scripts' } |
-        Select-Object -ExpandProperty Name)
-    foreach ($diskSN in $onDiskSNs) {
-        if (-not $manifest.devices.PSObject.Properties[$diskSN]) {
-            $issues.Add((_NewContentIssue 'Warning' 'DirectoryStructure' $diskSN '' "Device folder '$diskSN' exists on disk but has no entry in manifest.devices"))
+    # Native layout: files at golden root (no SN subfolder). Multi-device: files under {SN}/.
+    $isNative = $manifest.PSObject.Properties['nativeLayout'] -and $manifest.nativeLayout
+
+    # Orphan device folders (on disk but absent from manifest) — skip for native layout
+    if (-not $isNative) {
+        $onDiskSNs = @(Get-ChildItem -LiteralPath $GoldenPath -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch '^_' -and $_.Name -ne 'scripts' } |
+            Select-Object -ExpandProperty Name)
+        foreach ($diskSN in $onDiskSNs) {
+            if (-not $manifest.devices.PSObject.Properties[$diskSN]) {
+                $issues.Add((_NewContentIssue 'Warning' 'DirectoryStructure' $diskSN '' "Device folder '$diskSN' exists on disk but has no entry in manifest.devices"))
+            }
         }
     }
 
     # ── 2. Per-device validation ──────────────────────────────────────────────
     foreach ($snProp in $manifest.devices.PSObject.Properties) {
         $sn       = $snProp.Name
-        $devPath  = Join-Path $GoldenPath $sn
+        $devPath  = if ($isNative) { $GoldenPath } else { Join-Path $GoldenPath $sn }
         $triPath  = Join-Path $devPath 'Trilogy'
         $psPath   = Join-Path $devPath 'P-Series'
         $snPsPath = Join-Path $psPath $sn

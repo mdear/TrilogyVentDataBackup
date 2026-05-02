@@ -14,6 +14,16 @@ function Remove-TempDir {
     }
 }
 
+# Helper: resolve the device root within a golden archive.
+# For native-layout single-device goldens the device root IS the golden root.
+# For multi-device goldens the device root is {GoldenPath}/{SN}.
+function Get-DeviceRoot {
+    param([string]$GoldenPath, [string]$SN)
+    $manifest = Get-Content (Join-Path $GoldenPath 'manifest.json') -Raw | ConvertFrom-Json
+    $isNative = $manifest.PSObject.Properties['nativeLayout'] -and $manifest.nativeLayout
+    if ($isNative) { return $GoldenPath } else { return (Join-Path $GoldenPath $SN) }
+}
+
 function New-SyntheticEdf {
     <#
     .SYNOPSIS

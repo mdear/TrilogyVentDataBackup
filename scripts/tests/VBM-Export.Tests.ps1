@@ -203,7 +203,7 @@ Describe 'Export-ToTarget — file content preserved' {
             Export-ToTarget -GoldenPath $golden -Target $t
 
             # Compare first AD_.edf file from golden vs target
-            $srcEdf = Get-ChildItem -LiteralPath (Join-Path $golden "$sn\Trilogy") -Filter 'AD_*.edf' |
+            $srcEdf = Get-ChildItem -LiteralPath (Join-Path $golden 'Trilogy') -Filter 'AD_*.edf' |
                 Select-Object -First 1
             $dstEdf = Join-Path $t "Trilogy\$($srcEdf.Name)"
 

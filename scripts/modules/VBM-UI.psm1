@@ -875,6 +875,68 @@ function Show-GoldenDeviceMenu {
 
 #endregion
 
+#region ── Show-MultiDeviceDirectViewWarning ─────────────────────────────────
+
+function Show-MultiDeviceDirectViewWarning {
+    <#
+    .SYNOPSIS
+        Warn the operator that a multi-device golden export is NOT compatible with
+        Philips DirectView and ask whether to proceed.
+    .DESCRIPTION
+        Philips DirectView (the Trilogy 200 manufacturer analysis software) expects
+        an SD card formatted with Trilogy/ and P-Series/ folders at the root level —
+        the native single-device layout written by the ventilator itself.
+
+        When multiple devices are exported together each device occupies its own
+        subfolder (e.g. SN123456/Trilogy/).  Philips DirectView cannot read this
+        multi-device layout directly.
+
+        To create a DirectView-compatible SD card image the operator must perform a
+        separate golden Prepare export for each device, writing each to its own SD card.
+    .PARAMETER DeviceCount
+        Number of devices selected for this golden export.
+    .OUTPUTS
+        [bool] $true = proceed with multi-device export; $false = cancel.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$DeviceCount
+    )
+
+    Write-Host ''
+    Write-Host ('!' * 65) -ForegroundColor Red
+    Write-Host '  !! WARNING: PHILIPS DIRECTVIEW INCOMPATIBLE FORMAT !!' -ForegroundColor Red
+    Write-Host ('!' * 65) -ForegroundColor Red
+    Write-Host ''
+    Write-Host ("  You have selected $DeviceCount devices for this golden export.") -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  Philips DirectView (the Trilogy 200 analysis software) requires' -ForegroundColor White
+    Write-Host '  an SD card with Trilogy/ and P-Series/ folders at the ROOT level.' -ForegroundColor White
+    Write-Host '  This is the native single-device layout written by the ventilator.' -ForegroundColor White
+    Write-Host ''
+    Write-Host '  Multi-device exports place each device in its own subfolder:' -ForegroundColor Yellow
+    Write-Host '    SN123456/' -ForegroundColor DarkYellow
+    Write-Host '      Trilogy/' -ForegroundColor DarkYellow
+    Write-Host '      P-Series/' -ForegroundColor DarkYellow
+    Write-Host '    SN789012/' -ForegroundColor DarkYellow
+    Write-Host '      Trilogy/' -ForegroundColor DarkYellow
+    Write-Host '      P-Series/' -ForegroundColor DarkYellow
+    Write-Host ''
+    Write-Host '  Philips DirectView CANNOT read this layout. The SD card will' -ForegroundColor Red
+    Write-Host '  fail to load in the analysis software.' -ForegroundColor Red
+    Write-Host ''
+    Write-Host '  ┌─ To create DirectView-compatible SD cards ────────────────┐' -ForegroundColor Cyan
+    Write-Host '  │  Export ONE device at a time.                              │' -ForegroundColor Cyan
+    Write-Host '  │  Run Prepare separately for each device, writing each to   │' -ForegroundColor Cyan
+    Write-Host '  │  its own SD card (or separate folder).                     │' -ForegroundColor Cyan
+    Write-Host '  └────────────────────────────────────────────────────────────┘' -ForegroundColor Cyan
+    Write-Host ''
+
+    return Read-YesNo -Prompt '  Proceed with multi-device export anyway (NOT DirectView-compatible)?' -Default $false
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Show-MainMenu',
     'Show-SourcePicker',
@@ -884,6 +946,7 @@ Export-ModuleMember -Function @(
     'Show-ForceDevicesPrompt',
     'Show-DateRangePrompt',
     'Show-GoldenDeviceMenu',
+    'Show-MultiDeviceDirectViewWarning',
     'Write-ProgressBar',
     'Write-TimelineChart',
     'Show-GapSwimLanes'

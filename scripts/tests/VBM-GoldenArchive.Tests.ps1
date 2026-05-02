@@ -1,5 +1,5 @@
-#Requires -Version 5.1
-# VBM-GoldenArchive.Tests.ps1 — Pester 5 unit tests for ForceDevices and SplitSD features.
+﻿#Requires -Version 5.1
+# VBM-GoldenArchive.Tests.ps1 â€” Pester 5 unit tests for ForceDevices and SplitSD features.
 # Run via: Invoke-Pester -Path $PSScriptRoot (or scripts\tests\Run-Tests.ps1)
 
 BeforeAll {
@@ -10,7 +10,7 @@ BeforeAll {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — ForceDevices' {
+Describe 'New-GoldenArchive â€” ForceDevices' {
 
     BeforeAll {
         $script:root = New-TempDir
@@ -31,7 +31,7 @@ Describe 'New-GoldenArchive — ForceDevices' {
 
     It 'includes ONLY the forced device in the manifest' {
         $golden = New-GoldenArchive -TOC $script:toc -GoldenRoot $script:gRoot `
-            -ForceDevices @('TV000000001') -ForceReason 'Test — force single device'
+            -ForceDevices @('TV000000001') -ForceReason 'Test â€” force single device'
 
         $manifest = Get-Content (Join-Path $golden 'manifest.json') -Raw | ConvertFrom-Json
         $manifest.devices.PSObject.Properties.Name | Should -Contain 'TV000000001'
@@ -71,13 +71,13 @@ Describe 'New-GoldenArchive — ForceDevices' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'Update-GoldenArchive — ForceDevices bypass' {
+Describe 'Update-GoldenArchive â€” ForceDevices bypass' {
 
     BeforeAll {
         $script:root  = New-TempDir
         $script:gRoot = New-TempDir
 
-        # Single device backup — used to build the initial golden
+        # Single device backup â€” used to build the initial golden
         New-SyntheticBackup -BackupRoot $script:root -Name 'bak01' `
             -DeviceSNs @('TV000000003') -YearMonth '202408'
 
@@ -142,7 +142,7 @@ Describe 'Update-GoldenArchive — ForceDevices bypass' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — SplitSD manifest propagation' {
+Describe 'New-GoldenArchive â€” SplitSD manifest propagation' {
 
     BeforeAll {
         $script:root = New-TempDir
@@ -192,7 +192,7 @@ Describe 'New-GoldenArchive — SplitSD manifest propagation' {
 
         $inv2 = Get-BackupInventory -BackupRoot $script:root
         $toc2 = Get-BackupTOC -Inventory $inv2
-        # Do NOT call Find-SplitSD — TV000000005 should have no annotation
+        # Do NOT call Find-SplitSD â€” TV000000005 should have no annotation
 
         $golden = New-GoldenArchive -TOC $toc2 -GoldenRoot $script:gRoot `
             -Devices @('TV000000005')
@@ -250,7 +250,7 @@ Describe 'Test-GoldenIntegrity' {
                 -Devices @('TV000000011'))
 
             # Delete one EDF file from the golden
-            $edf = Get-ChildItem -LiteralPath (Join-Path $gold2 'TV000000011\Trilogy') `
+            $edf = Get-ChildItem -LiteralPath (Join-Path $gold2 'Trilogy') `
                 -Filter 'AD_*.edf' | Select-Object -First 1
             Remove-Item $edf.FullName -Force
 
@@ -274,7 +274,7 @@ Describe 'Test-GoldenIntegrity' {
                 -Devices @('TV000000012'))
 
             # Overwrite an EDF file with different content (same path, different bytes)
-            $edf   = Get-ChildItem -LiteralPath (Join-Path $gold3 'TV000000012\Trilogy') `
+            $edf   = Get-ChildItem -LiteralPath (Join-Path $gold3 'Trilogy') `
                 -Filter 'AD_*.edf' | Select-Object -First 1
             $bytes = [System.IO.File]::ReadAllBytes($edf.FullName)
             $bytes[0] = [byte]($bytes[0] -bxor 0xFF)
@@ -301,8 +301,8 @@ Describe 'Test-GoldenIntegrity' {
             $gold4 = [string](New-GoldenArchive -TOC $toc4 -GoldenRoot $g4 -Devices @($snGood))
 
             # Overwrite the Recording ID field (offset 88, 80 bytes) so the EDF header
-            # embeds a different SN — then update the manifest hash so only the SN check fails.
-            $adPath = Get-ChildItem -LiteralPath (Join-Path $gold4 "$snGood\Trilogy") `
+            # embeds a different SN â€” then update the manifest hash so only the SN check fails.
+            $adPath = Get-ChildItem -LiteralPath (Join-Path $gold4 'Trilogy') `
                 -Filter 'AD_*.edf' | Select-Object -First 1 -ExpandProperty FullName
             $bytes  = [System.IO.File]::ReadAllBytes($adPath)
             $enc    = [System.Text.Encoding]::ASCII
@@ -327,7 +327,7 @@ Describe 'Test-GoldenIntegrity' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'Update-GoldenArchive — goldenSequence and previousGolden chain' {
+Describe 'Update-GoldenArchive â€” goldenSequence and previousGolden chain' {
 
     BeforeAll {
         $script:bRoot = New-TempDir
@@ -342,7 +342,7 @@ Describe 'Update-GoldenArchive — goldenSequence and previousGolden chain' {
         $script:gold1 = [string](New-GoldenArchive -TOC $toc1 -GoldenRoot $script:gRoot `
             -Devices @($script:sn))
 
-        # Add a new backup with different EDF body size so hash changes → forced update
+        # Add a new backup with different EDF body size so hash changes â†’ forced update
         New-SyntheticBackup -BackupRoot $script:bRoot -Name 'bak02' `
             -DeviceSNs @($script:sn) -YearMonth '202409' -EdfBodyBytes 512
         $inv2         = Get-BackupInventory -BackupRoot $script:bRoot
@@ -379,7 +379,7 @@ Describe 'Update-GoldenArchive — goldenSequence and previousGolden chain' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — SplitSD file merging from both spans' {
+Describe 'New-GoldenArchive â€” SplitSD file merging from both spans' {
 
     BeforeAll {
         $script:bRoot = New-TempDir
@@ -408,26 +408,26 @@ Describe 'New-GoldenArchive — SplitSD file merging from both spans' {
     }
 
     It 'includes EDF files from the early span in the golden Trilogy/' {
-        $triPath = Join-Path $script:golden "$script:sn\Trilogy"
+        $triPath = Join-Path $script:golden 'Trilogy'
         $files   = @(Get-ChildItem -LiteralPath $triPath -Filter '*202401*.edf')
         $files.Count | Should -BeGreaterThan 0
     }
 
     It 'includes EDF files from the late span in the golden Trilogy/' {
-        $triPath = Join-Path $script:golden "$script:sn\Trilogy"
+        $triPath = Join-Path $script:golden 'Trilogy'
         $files   = @(Get-ChildItem -LiteralPath $triPath -Filter '*202408*.edf')
         $files.Count | Should -BeGreaterThan 0
     }
 
     It 'total Trilogy file count spans both months' {
-        $triPath = Join-Path $script:golden "$script:sn\Trilogy"
+        $triPath = Join-Path $script:golden 'Trilogy'
         $total   = @(Get-ChildItem -LiteralPath $triPath -Filter '*.edf').Count
         # 2 devices * 2 months = at least 4 EDF files (each month has AD + DD pair)
         $total | Should -BeGreaterThan 3
     }
 
     It 'last.txt in the golden P-Series root points to the correct SN' {
-        $lastTxt = Join-Path $script:golden "$script:sn\P-Series\last.txt"
+        $lastTxt = Join-Path $script:golden 'P-Series\last.txt'
         Test-Path $lastTxt | Should -Be $true
         (Get-Content $lastTxt -Raw).Trim() | Should -Be $script:sn
     }
@@ -458,18 +458,18 @@ Describe 'New-GoldenArchive - basic path (no ForceDevices no SplitSD)' {
     }
 
     It 'creates the device Trilogy/ directory with EDF files' {
-        $triPath = Join-Path $script:goldB "$script:snB\Trilogy"
+        $triPath = Join-Path $script:goldB 'Trilogy'
         Test-Path $triPath | Should -Be $true
         @(Get-ChildItem -LiteralPath $triPath -Filter '*.edf').Count | Should -BeGreaterThan 0
     }
 
     It 'creates P-Series/{SN}/ with prop.txt' {
-        $propPath = Join-Path $script:goldB "$script:snB\P-Series\$script:snB\prop.txt"
+        $propPath = Join-Path $script:goldB "P-Series\$script:snB\prop.txt"
         Test-Path $propPath | Should -Be $true
     }
 
     It 'creates P-Series/{SN}/ with FILES.SEQ' {
-        $seqPath = Join-Path $script:goldB "$script:snB\P-Series\$script:snB\FILES.SEQ"
+        $seqPath = Join-Path $script:goldB "P-Series\$script:snB\FILES.SEQ"
         Test-Path $seqPath | Should -Be $true
     }
 
@@ -567,7 +567,7 @@ Describe 'Test-GoldenIntegrity - corrupt manifest schema' {
 
             $result = Test-GoldenIntegrity -GoldenPath $g
             # Without a devices section the integrity check cannot verify any files
-            # It should either fail or pass with 0 files — both are acceptable.
+            # It should either fail or pass with 0 files â€” both are acceptable.
             # The key requirement: it must NOT throw an unhandled exception.
             $result | Should -Not -BeNullOrEmpty
         } finally {
@@ -622,7 +622,7 @@ Describe 'Test-GoldenContent - 512-byte EDF header variant' {
                 -DeviceSNs @($sn300) -YearMonth '202401'
             $triDir300 = Join-Path $root300 "bak_300\Trilogy"
             Get-ChildItem -LiteralPath $triDir300 -Filter '*.edf' | ForEach-Object {
-                # 300 is not a multiple of 256 — clearly invalid per EDF spec
+                # 300 is not a multiple of 256 â€” clearly invalid per EDF spec
                 New-SyntheticEdf -Path $_.FullName -SN $sn300 -HeaderBytesValue 300
             }
             $inv300   = Get-BackupInventory -BackupRoot $root300
@@ -642,7 +642,7 @@ Describe 'Test-GoldenContent - 512-byte EDF header variant' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — Rewind: orphaned Trilogy pairs' {
+Describe 'New-GoldenArchive â€” Rewind: orphaned Trilogy pairs' {
 
     BeforeAll {
         $script:bRootRw = New-TempDir
@@ -655,11 +655,11 @@ Describe 'New-GoldenArchive — Rewind: orphaned Trilogy pairs' {
         $bPath = New-SyntheticBackup -BackupRoot $script:bRootRw -Name 'bak_orphan' `
             -DeviceSNs @($script:snRw) -YearMonth '202409'
 
-        # Orphaned AD for 202408 — no matching DD
+        # Orphaned AD for 202408 â€” no matching DD
         New-SyntheticEdf -Path (Join-Path $bPath 'Trilogy\AD_202408_000.edf') -SN $script:snRw
-        # WD file for 202408 — month has no complete pair
+        # WD file for 202408 â€” month has no complete pair
         New-SyntheticEdf -Path (Join-Path $bPath 'Trilogy\WD_20240823_000.edf') -SN $script:snRw
-        # EL_ CSV for 202408 — month has no complete pair
+        # EL_ CSV for 202408 â€” month has no complete pair
         Set-Content (Join-Path $bPath "Trilogy\EL_$($script:snRw)_20240823.csv") `
             "SN=$($script:snRw)" -Encoding UTF8
 
@@ -675,23 +675,23 @@ Describe 'New-GoldenArchive — Rewind: orphaned Trilogy pairs' {
     }
 
     It 'drops orphaned AD_202408 (no matching DD) from the golden Trilogy/' {
-        $triPath = Join-Path $script:goldRw "$($script:snRw)\Trilogy"
+        $triPath = Join-Path $script:goldRw 'Trilogy'
         Test-Path (Join-Path $triPath 'AD_202408_000.edf') | Should -Be $false
     }
 
     It 'keeps the complete AD+DD pair for month 202409' {
-        $triPath = Join-Path $script:goldRw "$($script:snRw)\Trilogy"
+        $triPath = Join-Path $script:goldRw 'Trilogy'
         @(Get-ChildItem -LiteralPath $triPath -Filter 'AD_202409_*.edf').Count | Should -BeGreaterThan 0
         @(Get-ChildItem -LiteralPath $triPath -Filter 'DD_202409_*.edf').Count | Should -BeGreaterThan 0
     }
 
     It 'drops WD file whose month (202408) has no complete AD+DD pair' {
-        $triPath = Join-Path $script:goldRw "$($script:snRw)\Trilogy"
+        $triPath = Join-Path $script:goldRw 'Trilogy'
         @(Get-ChildItem -LiteralPath $triPath -Filter 'WD_202408*.edf').Count | Should -Be 0
     }
 
     It 'drops EL_ CSV whose month (202408) has no complete AD+DD pair' {
-        $triPath = Join-Path $script:goldRw "$($script:snRw)\Trilogy"
+        $triPath = Join-Path $script:goldRw 'Trilogy'
         @(Get-ChildItem -LiteralPath $triPath -Filter 'EL_*_202408*.csv').Count | Should -Be 0
     }
 
@@ -711,7 +711,7 @@ Describe 'New-GoldenArchive — Rewind: orphaned Trilogy pairs' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — Rewind: orphaned DD (no matching AD)' {
+Describe 'New-GoldenArchive â€” Rewind: orphaned DD (no matching AD)' {
 
     It 'drops orphaned DD file and records DroppedOrphan in rewindLog' {
         $b = New-TempDir; $g = New-TempDir
@@ -727,7 +727,7 @@ Describe 'New-GoldenArchive — Rewind: orphaned DD (no matching AD)' {
             $gold = [string](New-GoldenArchive -TOC $toc -GoldenRoot $g -Devices @($sn))
 
             # Orphaned DD must not be present
-            $triPath = Join-Path $gold "$sn\Trilogy"
+            $triPath = Join-Path $gold 'Trilogy'
             Test-Path (Join-Path $triPath 'DD_202408_000.edf') | Should -Be $false
 
             # rewindLog must have DroppedOrphan
@@ -740,7 +740,7 @@ Describe 'New-GoldenArchive — Rewind: orphaned DD (no matching AD)' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
+Describe 'New-GoldenArchive â€” Rewind: P-Series consistency' {
 
     It 'falls back to valid SL_SAPPHIRE.json when newest version is invalid JSON' {
         $b = New-TempDir; $g = New-TempDir
@@ -764,7 +764,7 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
             $gold = [string](New-GoldenArchive -TOC $toc -GoldenRoot $g -Devices @($sn))
 
             # Golden SL_SAPPHIRE.json must start with '{' (valid JSON object start)
-            $slGolden = Join-Path $gold "$sn\P-Series\$sn\SL_SAPPHIRE.json"
+            $slGolden = Join-Path $gold "P-Series\$sn\SL_SAPPHIRE.json"
             Test-Path $slGolden | Should -Be $true
             (Get-Content $slGolden -Raw).Trim()[0] | Should -Be '{'
 
@@ -798,7 +798,7 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
             $gold = [string](New-GoldenArchive -TOC $toc -GoldenRoot $g -Devices @($sn))
 
             # Golden prop.txt must have the correct SN
-            $propGolden = Join-Path $gold "$sn\P-Series\$sn\prop.txt"
+            $propGolden = Join-Path $gold "P-Series\$sn\prop.txt"
             $snLine     = (Get-Content $propGolden) | Where-Object { $_ -match '^SN\s*=' } |
                           Select-Object -First 1
             ($snLine -split '=', 2)[1].Trim() | Should -Be $sn
@@ -816,8 +816,8 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
         $b = New-TempDir; $g = New-TempDir
         try {
             $sn      = 'TV990002003'
-            $ymGood  = '202409'   # complete AD+DD pair → month committed
-            $ymBad   = '202408'   # orphaned AD only → month NOT committed → PP files must be dropped
+            $ymGood  = '202409'   # complete AD+DD pair â†’ month committed
+            $ymBad   = '202408'   # orphaned AD only â†’ month NOT committed â†’ PP files must be dropped
 
             # Base backup: complete pair for 202409 (sets CompleteMonths = {'202409'})
             $bPath = New-SyntheticBackup -BackupRoot $b -Name 'bak_pp_orphan' `
@@ -839,7 +839,7 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
             $gold = [string](New-GoldenArchive -TOC $toc -GoldenRoot $g -Devices @($sn))
 
             # PP JSON for month 202408 must be absent (month has no committed pair)
-            $psSnDir = Join-Path $gold "$sn\P-Series\$sn"
+            $psSnDir = Join-Path $gold "P-Series\$sn"
             $ppBad   = @(Get-ChildItem -LiteralPath $psSnDir -Filter "PP_${ymBad}*.json" `
                 -Recurse -ErrorAction SilentlyContinue)
             $ppBad.Count | Should -Be 0
@@ -873,7 +873,7 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
             $gold = [string](New-GoldenArchive -TOC $toc -GoldenRoot $g -Devices @($sn))
 
             # SL_SAPPHIRE.json must be absent when no valid fallback exists
-            $slPath = Join-Path $gold "$sn\P-Series\$sn\SL_SAPPHIRE.json"
+            $slPath = Join-Path $gold "P-Series\$sn\SL_SAPPHIRE.json"
             Test-Path $slPath | Should -Be $false
 
             # rewindLog must record DroppedInvalid (not ReplacedInvalid)
@@ -887,7 +887,7 @@ Describe 'New-GoldenArchive — Rewind: P-Series consistency' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — Rewind: manifest rewindLog field' {
+Describe 'New-GoldenArchive â€” Rewind: manifest rewindLog field' {
 
     It 'manifest device entry has rewindLog array empty for a fully clean device' {
         $b = New-TempDir; $g = New-TempDir
@@ -909,7 +909,7 @@ Describe 'New-GoldenArchive — Rewind: manifest rewindLog field' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'Update-GoldenArchive — Rewind: rewindLog recorded in updated golden' {
+Describe 'Update-GoldenArchive â€” Rewind: rewindLog recorded in updated golden' {
 
     It 'records DroppedOrphan in manifest rewindLog when update detects orphaned EDF pairs' {
         $b = New-TempDir; $g = New-TempDir
@@ -922,7 +922,7 @@ Describe 'Update-GoldenArchive — Rewind: rewindLog recorded in updated golden'
             $toc1  = Get-BackupTOC -Inventory $inv1
             $gold1 = [string](New-GoldenArchive -TOC $toc1 -GoldenRoot $g -Devices @($sn))
 
-            # Add a second backup: complete 202409 pair (larger EDF → change detected by Update)
+            # Add a second backup: complete 202409 pair (larger EDF â†’ change detected by Update)
             # plus an orphaned AD_202410 (no matching DD) that triggers a DroppedOrphan event
             $bPath2 = New-SyntheticBackup -BackupRoot $b -Name 'bak_v2' `
                 -DeviceSNs @($sn) -YearMonth '202409' -EdfBodyBytes 512
@@ -940,7 +940,7 @@ Describe 'Update-GoldenArchive — Rewind: rewindLog recorded in updated golden'
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — golden sub-entries excluded from cleanNames' {
+Describe 'New-GoldenArchive â€” golden sub-entries excluded from cleanNames' {
     # Regression test: when the TOC already contains a _golden_* entry (IsGolden=$true),
     # building a NEW golden must not use the old golden sub-entry as a source backup.
     # Before the fix, the old golden had Integrity='Golden' which is -ne 'Contaminated',
@@ -961,7 +961,7 @@ Describe 'New-GoldenArchive — golden sub-entries excluded from cleanNames' {
         $script:firstGolden = [string](New-GoldenArchive -TOC $toc1 `
             -GoldenRoot $script:bRootGE -Devices @($script:snGE))
 
-        # Re-scan — inventory now includes the _golden_* folder
+        # Re-scan â€” inventory now includes the _golden_* folder
         $inv2           = Get-BackupInventory -BackupRoot $script:bRootGE -IncludeGoldens
         $script:toc2    = Get-BackupTOC -Inventory $inv2
 
@@ -994,7 +994,7 @@ Describe 'New-GoldenArchive — golden sub-entries excluded from cleanNames' {
         $manifest  = Get-Content (Join-Path $newGolden 'manifest.json') -Raw | ConvertFrom-Json
         $srcFolders = @($manifest.devices.$($script:snGE).sourceFolders)
         # Source folders must all be regular backups (bak_ge01, bak_ge02)
-        # — none should be the old _golden_* folder
+        # â€” none should be the old _golden_* folder
         $goldenName = [System.IO.Path]::GetFileName($script:firstGolden)
         $srcFolders | Should -Not -Contain $goldenName
         $srcFolders.Count | Should -BeGreaterThan 0
@@ -1002,7 +1002,7 @@ Describe 'New-GoldenArchive — golden sub-entries excluded from cleanNames' {
 }
 
 # ---------------------------------------------------------------------------
-Describe 'New-GoldenArchive — Salvage from contaminated backup' {
+Describe 'New-GoldenArchive â€” Salvage from contaminated backup' {
 
     BeforeAll {
         $script:bRootSv = New-TempDir

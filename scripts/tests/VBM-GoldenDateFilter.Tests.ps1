@@ -52,7 +52,7 @@ Describe 'New-GoldenArchive — no date filter' {
     It 'includes EDF files from all months when neither FromDate nor ToDate supplied' {
         $golden  = New-GoldenArchive -TOC $script:toc -GoldenRoot $script:gRoot `
                        -Devices @($script:sn)
-        $triDir  = Join-Path $golden "$($script:sn)\Trilogy"
+        $triDir  = Join-Path $golden 'Trilogy'
         $adFiles = @(Get-ChildItem $triDir -Filter 'AD_*.edf').Name
 
         $adFiles | Should -Contain 'AD_202401_000.edf'
@@ -81,7 +81,7 @@ Describe 'New-GoldenArchive — FromDate + ToDate (mid-range)' {
         # Single golden built once; all It blocks in this Describe share it
         $script:golden = New-GoldenArchive -TOC $script:toc -GoldenRoot $script:gRoot `
                              -Devices @($script:sn) -FromDate '2024-02-01' -ToDate '2024-04-30'
-        $script:triDir = Join-Path $script:golden "$($script:sn)\Trilogy"
+        $script:triDir = Join-Path $script:golden 'Trilogy'
     }
 
     AfterAll {
@@ -111,28 +111,28 @@ Describe 'New-GoldenArchive — FromDate + ToDate (mid-range)' {
     }
 
     It 'excludes PP ring-buffer entries whose month is before FromDate' {
-        $psDevDir = Join-Path $script:golden "$($script:sn)\P-Series\$($script:sn)"
+        $psDevDir = Join-Path $script:golden "P-Series\$($script:sn)"
         $allPP    = @(Get-ChildItem $psDevDir -Recurse -Filter 'PP_*.json').Name
         $jan      = @($allPP | Where-Object { $_ -like 'PP_202401*' })
         $jan.Count | Should -Be 0
     }
 
     It 'excludes PP ring-buffer entries whose month is after ToDate' {
-        $psDevDir = Join-Path $script:golden "$($script:sn)\P-Series\$($script:sn)"
+        $psDevDir = Join-Path $script:golden "P-Series\$($script:sn)"
         $allPP    = @(Get-ChildItem $psDevDir -Recurse -Filter 'PP_*.json').Name
         $jun      = @($allPP | Where-Object { $_ -like 'PP_202406*' })
         $jun.Count | Should -Be 0
     }
 
     It 'includes PP ring-buffer entries whose month is within the range' {
-        $psDevDir = Join-Path $script:golden "$($script:sn)\P-Series\$($script:sn)"
+        $psDevDir = Join-Path $script:golden "P-Series\$($script:sn)"
         $allPP    = @(Get-ChildItem $psDevDir -Recurse -Filter 'PP_*.json').Name
         $mar      = @($allPP | Where-Object { $_ -like 'PP_202403*' })
         $mar.Count | Should -BeGreaterThan 0
     }
 
     It 'keeps steering files (prop.txt, FILES.SEQ, SL_SAPPHIRE.json) regardless of date range' {
-        $psDevDir = Join-Path $script:golden "$($script:sn)\P-Series\$($script:sn)"
+        $psDevDir = Join-Path $script:golden "P-Series\$($script:sn)"
         (Test-Path (Join-Path $psDevDir 'prop.txt'))        | Should -Be $true
         (Test-Path (Join-Path $psDevDir 'FILES.SEQ'))       | Should -Be $true
         (Test-Path (Join-Path $psDevDir 'SL_SAPPHIRE.json'))| Should -Be $true
@@ -168,7 +168,7 @@ Describe 'New-GoldenArchive — FromDate only (lower bound)' {
 
         $script:golden = New-GoldenArchive -TOC $script:toc -GoldenRoot $script:gRoot `
                              -Devices @($script:sn) -FromDate '2024-03-01'
-        $script:triDir = Join-Path $script:golden "$($script:sn)\Trilogy"
+        $script:triDir = Join-Path $script:golden 'Trilogy'
     }
 
     AfterAll {
@@ -210,7 +210,7 @@ Describe 'New-GoldenArchive — ToDate only (upper bound)' {
 
         $script:golden = New-GoldenArchive -TOC $script:toc -GoldenRoot $script:gRoot `
                              -Devices @($script:sn) -ToDate '2024-03-31'
-        $script:triDir = Join-Path $script:golden "$($script:sn)\Trilogy"
+        $script:triDir = Join-Path $script:golden 'Trilogy'
     }
 
     AfterAll {
@@ -314,7 +314,7 @@ Describe 'Update-GoldenArchive — date range filter' {
     }
 
     It 'applies date filter — only in-range month present in Trilogy/' {
-        $triDir  = Join-Path $script:filtGolden "$($script:sn)\Trilogy"
+        $triDir  = Join-Path $script:filtGolden 'Trilogy'
         $adFiles = @(Get-ChildItem $triDir -Filter 'AD_*.edf').Name
         $adFiles | Should -Contain 'AD_202403_000.edf'
         $adFiles | Should -Not -Contain 'AD_202401_000.edf'

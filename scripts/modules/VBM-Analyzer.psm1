@@ -259,19 +259,40 @@ function Get-BackupInventory {
             $manifestPath = Join-Path $item.FullName 'manifest.json'
             if (-not (Test-Path $manifestPath)) { continue }
 
+            # Detect native layout from manifest
+            $gManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+            $gNative   = $gManifest.PSObject.Properties['nativeLayout'] -and $gManifest.nativeLayout
+
             $subList = [System.Collections.Generic.List[object]]::new()
-            foreach ($snDir in Get-ChildItem -LiteralPath $item.FullName -Directory -ErrorAction SilentlyContinue) {
-                $sHasT = Test-Path (Join-Path $snDir.FullName 'Trilogy')
-                $sHasP = Test-Path (Join-Path $snDir.FullName 'P-Series')
+            if ($gNative) {
+                # Native layout: Trilogy/ and P-Series/ at golden root — single logical sub-entry
+                $sHasT = Test-Path (Join-Path $item.FullName 'Trilogy')
+                $sHasP = Test-Path (Join-Path $item.FullName 'P-Series')
                 if ($sHasT -or $sHasP) {
+                    $nativeSN = @($gManifest.devices.PSObject.Properties.Name)[0]
                     $subList.Add([PSCustomObject]@{
-                        Name       = "$name/$($snDir.Name)"
-                        Path       = $snDir.FullName
+                        Name       = "$name/$nativeSN"
+                        Path       = $item.FullName
                         HasTrilogy = $sHasT
                         HasPSeries = $sHasP
                         SubBackups = @()
                         IsGolden   = $true
                     })
+                }
+            } else {
+                foreach ($snDir in Get-ChildItem -LiteralPath $item.FullName -Directory -ErrorAction SilentlyContinue) {
+                    $sHasT = Test-Path (Join-Path $snDir.FullName 'Trilogy')
+                    $sHasP = Test-Path (Join-Path $snDir.FullName 'P-Series')
+                    if ($sHasT -or $sHasP) {
+                        $subList.Add([PSCustomObject]@{
+                            Name       = "$name/$($snDir.Name)"
+                            Path       = $snDir.FullName
+                            HasTrilogy = $sHasT
+                            HasPSeries = $sHasP
+                            SubBackups = @()
+                            IsGolden   = $true
+                        })
+                    }
                 }
             }
             if ($subList.Count -eq 0) { continue }

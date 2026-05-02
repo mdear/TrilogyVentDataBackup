@@ -113,7 +113,16 @@ Read ARCHITECTURE.md "SD Card Data Format Reference" before implementing.
 - Subsequent goldens must produce a complete, standalone dataset per included
   device — DirectView expects all files present, not deltas
 - Multi-device exports use `/{SN}/Trilogy/` and `/{SN}/P-Series/` subdirectories.
-  DirectView is pointed at each `{SN}/` subfolder individually.
+  DirectView **cannot** read this layout from the SD card root — the subfolder
+  structure is not the native format the ventilator writes.
+- **User warning gate (wizard mode):** When the Prepare flow detects >1 device
+  selected, `Show-MultiDeviceDirectViewWarning` displays a prominent warning
+  explaining the incompatibility, advises exporting one device at a time for
+  DirectView-compatible SD cards, and defaults to cancelling the operation.
+  The user must explicitly confirm to proceed with a multi-device export.
+- **Non-interactive warning:** `Export-ToTarget` emits a `Write-Warning` for
+  multi-device exports regardless of calling context (CLI, scripted, wizard),
+  ensuring the incompatibility is always surfaced.
 
 ### Golden Archive Semantics
 - **Roster = devices with CHANGED DATA**, not current physical device roster

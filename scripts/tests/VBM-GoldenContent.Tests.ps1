@@ -56,7 +56,8 @@ BeforeAll {
     # Helper: return the full path of the first AD_*.edf in a golden for a given SN.
     function Get-FirstAD {
         param([string]$GoldenPath, [string]$SN)
-        Get-ChildItem -LiteralPath (Join-Path $GoldenPath "$SN\Trilogy") -Filter 'AD_*.edf' |
+        $devRoot = Get-DeviceRoot -GoldenPath $GoldenPath -SN $SN
+        Get-ChildItem -LiteralPath (Join-Path $devRoot 'Trilogy') -Filter 'AD_*.edf' |
             Select-Object -First 1 -ExpandProperty FullName
     }
 }
@@ -145,7 +146,7 @@ Describe 'Test-GoldenContent â€” DirectView compatibility gates' {
         $bRoot5 = New-TempDir; $gRoot5 = New-TempDir
         try {
             $gold5 = New-TestGolden -BackupRoot $bRoot5 -GoldenRoot $gRoot5 -SNs @('TV200000002')
-            $triPath = Join-Path $gold5 'TV200000002\Trilogy'
+            $triPath = Join-Path $gold5 'Trilogy'
             if (Test-Path $triPath) { Remove-Item $triPath -Recurse -Force }
             $result = Test-GoldenContent -GoldenPath $gold5
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Severity -eq 'Critical' -and $_.Message -match 'Trilogy' })
@@ -157,7 +158,7 @@ Describe 'Test-GoldenContent â€” DirectView compatibility gates' {
         $bRoot6 = New-TempDir; $gRoot6 = New-TempDir
         try {
             $gold6 = New-TestGolden -BackupRoot $bRoot6 -GoldenRoot $gRoot6 -SNs @('TV200000003')
-            $psDir = Join-Path $gold6 'TV200000003\P-Series'
+            $psDir = Join-Path $gold6 'P-Series'
             if (Test-Path $psDir) { Remove-Item $psDir -Recurse -Force }
             $result = Test-GoldenContent -GoldenPath $gold6
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Severity -eq 'Critical' -and $_.Message -match 'P-Series' })
@@ -169,7 +170,7 @@ Describe 'Test-GoldenContent â€” DirectView compatibility gates' {
         $bRoot7 = New-TempDir; $gRoot7 = New-TempDir
         try {
             $gold7 = New-TestGolden -BackupRoot $bRoot7 -GoldenRoot $gRoot7 -SNs @('TV200000004')
-            $lastTxt = Join-Path $gold7 'TV200000004\P-Series\last.txt'
+            $lastTxt = Join-Path $gold7 'P-Series\last.txt'
             if (Test-Path $lastTxt) { Remove-Item $lastTxt -Force }
             $result = Test-GoldenContent -GoldenPath $gold7
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Message -match 'last.txt' })
@@ -182,7 +183,7 @@ Describe 'Test-GoldenContent â€” DirectView compatibility gates' {
         try {
             $sn8   = 'TV200000005'
             $gold8 = New-TestGolden -BackupRoot $bRoot8 -GoldenRoot $gRoot8 -SNs @($sn8)
-            $lastTxt = Join-Path $gold8 "$sn8\P-Series\last.txt"
+            $lastTxt = Join-Path $gold8 "P-Series\last.txt"
             Set-Content $lastTxt 'TVWRONGWRONG' -Encoding UTF8
             $result = Test-GoldenContent -GoldenPath $gold8
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Severity -eq 'Error' -and $_.File -match 'last.txt' })
@@ -195,7 +196,7 @@ Describe 'Test-GoldenContent â€” DirectView compatibility gates' {
         try {
             $sn9   = 'TV200000006'
             $gold9 = New-TestGolden -BackupRoot $bRoot9 -GoldenRoot $gRoot9 -SNs @($sn9)
-            $triPath = Join-Path $gold9 "$sn9\Trilogy"
+            $triPath = Join-Path $gold9 'Trilogy'
             Get-ChildItem -LiteralPath $triPath -Filter 'AD_*.edf' | Remove-Item -Force
             $result = Test-GoldenContent -GoldenPath $gold9
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Severity -eq 'Critical' -and $_.Message -match 'AD_' })
@@ -230,7 +231,7 @@ Describe 'Test-GoldenContent â€” EDF format validation' {
         try {
             $snT   = 'TV300000002'
             $goldT = New-TestGolden -BackupRoot $bRootT -GoldenRoot $gRootT -SNs @($snT)
-            $triPath = Join-Path $goldT "$snT\Trilogy"
+            $triPath = Join-Path $goldT 'Trilogy'
             $firstEdf = Get-ChildItem -LiteralPath $triPath -Filter 'AD_*.edf' | Select-Object -First 1
             # Overwrite with tiny file (< 256 bytes)
             [System.IO.File]::WriteAllBytes($firstEdf.FullName, [byte[]]::new(100))
@@ -254,7 +255,7 @@ Describe 'Test-GoldenContent â€” EDF format validation' {
         try {
             $snS   = 'TV300000003'
             $goldS = New-TestGolden -BackupRoot $bRootS -GoldenRoot $gRootS -SNs @($snS)
-            $triPath = Join-Path $goldS "$snS\Trilogy"
+            $triPath = Join-Path $goldS 'Trilogy'
             $firstEdf = Get-ChildItem -LiteralPath $triPath -Filter 'AD_*.edf' | Select-Object -First 1
             # Overwrite the EDF header SN with a different SN (same size file)
             $bytes = [System.IO.File]::ReadAllBytes($firstEdf.FullName)
@@ -275,7 +276,7 @@ Describe 'Test-GoldenContent â€” EDF format validation' {
         try {
             $snP   = 'TV300000004'
             $goldP = New-TestGolden -BackupRoot $bRootP -GoldenRoot $gRootP -SNs @($snP)
-            $triPath = Join-Path $goldP "$snP\Trilogy"
+            $triPath = Join-Path $goldP 'Trilogy'
             # Remove all AD files — should produce EdfPairing Error for each DD
             Get-ChildItem -LiteralPath $triPath -Filter 'AD_*.edf' | Remove-Item -Force
             # Also remove them from the manifest so we avoid unrelated integrity issues
@@ -311,7 +312,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
         try {
             $snW   = 'TV400000002'
             $goldW = New-TestGolden -BackupRoot $bRootW -GoldenRoot $gRootW -SNs @($snW)
-            $propPath = Join-Path $goldW "$snW\P-Series\$snW\prop.txt"
+            $propPath = Join-Path $goldW "P-Series\$snW\prop.txt"
             Set-Content $propPath "SN=TVWRONGWRONG`nMN=Trilogy 200`nPT=0x65`nSV=3.02" -Encoding UTF8
             $result = Test-GoldenContent -GoldenPath $goldW
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'PSeriesFormat' -and $_.Message -match 'TVWRONGWRONG' })
@@ -325,7 +326,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
         try {
             $snPT   = 'TV400000003'
             $goldPT = New-TestGolden -BackupRoot $bRootPT -GoldenRoot $gRootPT -SNs @($snPT)
-            $propPath = Join-Path $goldPT "$snPT\P-Series\$snPT\prop.txt"
+            $propPath = Join-Path $goldPT "P-Series\$snPT\prop.txt"
             Set-Content $propPath "SN=$snPT`nMN=Trilogy 200`nPT=65`nSV=3.02" -Encoding UTF8
             $result = Test-GoldenContent -GoldenPath $goldPT
             $ptIssues = @($result.Issues | Where-Object { $_.Category -eq 'PSeriesFormat' -and $_.Message -match 'PT' })
@@ -340,7 +341,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
         try {
             $snF   = 'TV400000004'
             $goldF = New-TestGolden -BackupRoot $bRootF -GoldenRoot $gRootF -SNs @($snF)
-            $psSnDir = Join-Path $goldF "$snF\P-Series\$snF"
+            $psSnDir = Join-Path $goldF "P-Series\$snF"
             $filesSeq   = Join-Path $psSnDir 'FILES.SEQ'
             $transSeq   = Join-Path $psSnDir 'TRANSMITFILE.SEQ'
             Set-Content $filesSeq  "file1`nfile2`nABCDEF01" -Encoding UTF8      # 2 entries + CRC
@@ -357,7 +358,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
             $snPP   = 'TV400000005'
             $goldPP = New-TestGolden -BackupRoot $bRootPP -GoldenRoot $gRootPP -SNs @($snPP)
             # Overwrite all PP JSON files with wrong SN
-            $psSnDir = Join-Path $goldPP "$snPP\P-Series\$snPP"
+            $psSnDir = Join-Path $goldPP "P-Series\$snPP"
             Get-ChildItem -LiteralPath $psSnDir -Filter 'PP_*.json' -Recurse | ForEach-Object {
                 Set-Content $_.FullName '{"SN":"TVWRONG","TimeStamp":1700000000,"BlowerHours":1000}' -Encoding UTF8
             }
@@ -373,7 +374,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
         try {
             $snTS   = 'TV400000006'
             $goldTS = New-TestGolden -BackupRoot $bRootTS -GoldenRoot $gRootTS -SNs @($snTS)
-            $psSnDir = Join-Path $goldTS "$snTS\P-Series\$snTS"
+            $psSnDir = Join-Path $goldTS "P-Series\$snTS"
             Get-ChildItem -LiteralPath $psSnDir -Filter 'PP_*.json' -Recurse | Select-Object -First 1 | ForEach-Object {
                 Set-Content $_.FullName "{`"SN`":`"$snTS`",`"BlowerHours`":1000}" -Encoding UTF8
             }
@@ -389,7 +390,7 @@ Describe 'Test-GoldenContent — P-Series format validation' {
         try {
             $snBH   = 'TV400000007'
             $goldBH = New-TestGolden -BackupRoot $bRootBH -GoldenRoot $gRootBH -SNs @($snBH)
-            $psSnDir = Join-Path $goldBH "$snBH\P-Series\$snBH"
+            $psSnDir = Join-Path $goldBH "P-Series\$snBH"
             Get-ChildItem -LiteralPath $psSnDir -Filter 'PP_*.json' -Recurse | Select-Object -First 1 | ForEach-Object {
                 Set-Content $_.FullName "{`"SN`":`"$snBH`",`"TimeStamp`":1700000000,`"BlowerHours`":-5}" -Encoding UTF8
             }
@@ -407,8 +408,8 @@ Describe 'Test-GoldenContent â€” DirectoryStructure orphan detection' {
     It 'reports Warning DirectoryStructure for a device folder not in manifest' {
         $bRootO = New-TempDir; $gRootO = New-TempDir
         try {
-            $snO   = 'TV500000001'
-            $goldO = New-TestGolden -BackupRoot $bRootO -GoldenRoot $gRootO -SNs @($snO)
+            # Use multi-device golden so orphan detection is active (skipped for native layout)
+            $goldO = New-TestGolden -BackupRoot $bRootO -GoldenRoot $gRootO -SNs @('TV500000001', 'TV500000010')
             # Create an extra device folder not in the manifest
             $null = New-Item -ItemType Directory -Path (Join-Path $goldO 'TVORPHAN') -Force
             $result = Test-GoldenContent -GoldenPath $goldO
@@ -422,8 +423,9 @@ Describe 'Test-GoldenContent â€” DirectoryStructure orphan detection' {
         $bRootM = New-TempDir; $gRootM = New-TempDir
         try {
             $snM   = 'TV500000002'
-            $goldM = New-TestGolden -BackupRoot $bRootM -GoldenRoot $gRootM -SNs @($snM)
-            # Delete the device folder entirely
+            # Use multi-device golden so directory structure checks apply
+            $goldM = New-TestGolden -BackupRoot $bRootM -GoldenRoot $gRootM -SNs @($snM, 'TV500000020')
+            # Delete one device folder entirely
             Remove-Item -LiteralPath (Join-Path $goldM $snM) -Recurse -Force
             $result = Test-GoldenContent -GoldenPath $goldM
             $missingIssues = @($result.Issues | Where-Object { $_.Category -eq 'DirectoryStructure' -and $_.Severity -eq 'Critical' })
@@ -525,7 +527,7 @@ Describe 'Test-GoldenContent — additional coverage' {
         try {
             $sn   = 'TV910000001'
             $gold = New-TestGolden -BackupRoot $b -GoldenRoot $g -SNs @($sn)
-            Remove-Item -LiteralPath (Join-Path $gold "$sn\P-Series\$sn\prop.txt") -Force
+            Remove-Item -LiteralPath (Join-Path $gold "P-Series\$sn\prop.txt") -Force
             $result = Test-GoldenContent -GoldenPath $gold
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'DirectViewCompat' -and $_.Message -match 'prop.txt' })
             $issues.Count       | Should -BeGreaterThan 0
@@ -539,7 +541,7 @@ Describe 'Test-GoldenContent — additional coverage' {
         try {
             $sn      = 'TV910000002'
             $gold    = New-TestGolden -BackupRoot $b -GoldenRoot $g -SNs @($sn)
-            $triPath = Join-Path $gold "$sn\Trilogy"
+            $triPath = Join-Path $gold 'Trilogy'
             # Remove all DD files so each AD has no pair
             Get-ChildItem -LiteralPath $triPath -Filter 'DD_*.edf' | Remove-Item -Force
             $result     = Test-GoldenContent -GoldenPath $gold
@@ -555,7 +557,7 @@ Describe 'Test-GoldenContent — additional coverage' {
         try {
             $sn   = 'TV910000003'
             $gold = New-TestGolden -BackupRoot $b -GoldenRoot $g -SNs @($sn)
-            Set-Content (Join-Path $gold "$sn\P-Series\$sn\SL_SAPPHIRE.json") '[1,2,3]' -Encoding UTF8
+            Set-Content (Join-Path $gold "P-Series\$sn\SL_SAPPHIRE.json") '[1,2,3]' -Encoding UTF8
             $result = Test-GoldenContent -GoldenPath $gold
             $issues = @($result.Issues | Where-Object { $_.Category -eq 'PSeriesFormat' -and $_.Message -match 'SL_SAPPHIRE' })
             $issues.Count       | Should -BeGreaterThan 0
@@ -569,7 +571,7 @@ Describe 'Test-GoldenContent — additional coverage' {
         try {
             $sn      = 'TV910000004'
             $gold    = New-TestGolden -BackupRoot $b -GoldenRoot $g -SNs @($sn)
-            $psSnDir = Join-Path $gold "$sn\P-Series\$sn"
+            $psSnDir = Join-Path $gold "P-Series\$sn"
             Get-ChildItem -LiteralPath $psSnDir -Filter 'PP_*.json' -Recurse |
                 Select-Object -First 1 | ForEach-Object {
                     Set-Content $_.FullName '{"TimeStamp":1700000000,"BlowerHours":500}' -Encoding UTF8
@@ -586,7 +588,7 @@ Describe 'Test-GoldenContent — additional coverage' {
         try {
             $sn      = 'TV910000005'
             $gold    = New-TestGolden -BackupRoot $b -GoldenRoot $g -SNs @($sn)
-            $psSnDir = Join-Path $gold "$sn\P-Series\$sn"
+            $psSnDir = Join-Path $gold "P-Series\$sn"
             Get-ChildItem -LiteralPath $psSnDir -Filter 'PP_*.json' -Recurse |
                 Select-Object -First 1 | ForEach-Object {
                     Set-Content $_.FullName "{`"SN`":`"$sn`",`"TimeStamp`":0,`"BlowerHours`":1200}" -Encoding UTF8

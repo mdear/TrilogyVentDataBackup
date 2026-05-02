@@ -101,7 +101,13 @@ Press **Y** and it creates one. That's it — you never need to open this folder
 5. The tool copies a clean, verified set of files to a location you choose
    (e.g., a blank SD card or USB drive)
 
-The output is compatible with Philips **DirectView** software.
+When a single device is selected, the output mirrors the native SD card layout
+and is directly compatible with Philips **DirectView** software.
+
+> **Multi-device warning:** If you select more than one device, the export uses a
+> subfolder layout that DirectView **cannot** read directly. The tool will warn you
+> before proceeding and recommend exporting one device at a time to create
+> DirectView-compatible SD card images.
 
 ---
 

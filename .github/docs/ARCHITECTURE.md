@@ -264,8 +264,17 @@ The primary user-facing action. Internally this:
 - Writes the export to the target SD card or folder
 
 For single-device exports, the output mirrors the native SD card layout so DirectView
-can read it directly. For multi-device exports, each device gets a subdirectory with
-a README explaining where to point DirectView.
+can read it directly from the SD card root.
+
+For multi-device exports, each device gets a subdirectory with a README explaining
+where to point DirectView. **Important:** This multi-device layout is NOT compatible
+with Philips DirectView when loaded directly — DirectView expects the native flat
+structure at the SD card root. The wizard displays a prominent warning
+(`Show-MultiDeviceDirectViewWarning`) when multiple devices are selected and
+recommends exporting one device at a time to create DirectView-compatible media.
+The user must explicitly override the default (No) to proceed with a multi-device
+export. Additionally, `Export-ToTarget` emits a `Write-Warning` for all multi-device
+exports regardless of invocation path.
 
 If the target already has content, the user sees a directory listing (names, dates,
 sizes) and must confirm before overwriting.
